@@ -24,44 +24,76 @@ def clean_year(value):
         return int(float(str(value).split('.')[0]))
     except:
         return None
-
 def clean_value(value):
     """
-    通用數值清洗 (來自 app_bk.py 增強版)：
-    1. 移除逗號 (,)
-    2. 移除單位 (tCO2e, tons等)
-    3. 判斷是否為百分比
-    4. [新增] 判斷括號數值為負數，例如 (5)% -> -0.05
-    回傳: (數值 float, 是否為百分比 bool, 是否為括號負數格式 bool)
+    通用數值清洗 (修復版)：
+    1. 修復誤判括號為負數的問題 (例如 "Scope (3)" 不應被視為負數)。
+    2. 修復數值黏連問題 (例如 "100 tCO2" 不應變 "1002")。
+    3. 支援會計負數格式 (例如 "(5)" -> -5)。
     """
     try:
-        if pd.isna(value) or value == 'None': return None, False, False
+        if pd.isna(value) or str(value).lower() == 'none': 
+            return None, False, False
+            
         str_val = str(value).strip()
         
-        # 判斷是否為負數 (括號包圍)
-        is_negative_format = '(' in str_val and ')' in str_val
-        
+        # 1. 判斷百分比
         is_percentage = '%' in str_val
         
-        # 移除非數字字符 (保留小數點)
-        clean_str = re.sub(r'[^\d.]', '', str_val)
+        # 2. 暫時移除 % 以便後續處理數值 (避免干擾數字提取)
+        temp_str = str_val.replace('%', '').strip()
         
-        if not clean_str: return None, False, False
+        # 3. 判斷是否為會計負數格式 (括號包住純數字)，例如 (5), (1,000.5)
+        # 嚴格檢查：括號內只能有數字、逗號、小數點，且必須佔據整個字串(或去頭去尾後)
+        accounting_pattern = r'^\s*\(\s*([\d,.]+)\s*\)\s*$'
+        accounting_match = re.match(accounting_pattern, temp_str)
         
-        float_val = float(clean_str)
+        is_negative_format = False
+        float_val = 0.0
         
-        # 處理負號邏輯
-        if is_negative_format or '-' in str_val:
-            float_val = -abs(float_val)
-        
-        # 如果原始字串有%，除以100
+        if accounting_match:
+            # 確實是 (5) 這種格式 -> 視為負數
+            is_negative_format = True
+            clean_str = accounting_match.group(1).replace(',', '')
+            float_val = -abs(float(clean_str))
+        else:
+            # 一般格式 extraction
+            # 尋找字串中「第一個」符合數值格式的部分
+            # 規則: (開頭/空白/括號) + (可選負號) + 數字(含逗號) + (可選小數點)
+            # 這樣可以避免抓到 tCO2 中的 2
+            extract_pattern = r'(?:^|[\s\(\[])([-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?)'
+            match = re.search(extract_pattern, temp_str)
+            
+            if match:
+                clean_str = match.group(1).replace(',', '')
+                float_val = float(clean_str)
+                # 這裡不自動轉負數，除非 extract 到的本身就有負號
+            else:
+                return None, False, False
+
+        # 4. 處理百分比數值
         if is_percentage:
             return float_val / 100, True, is_negative_format
         
         return float_val, False, is_negative_format
-    except:
-        return None, False, False
 
+    except Exception:
+        return None, False, False
+    
+def normalize_packaging_scope(scope):
+    s = scope.lower().strip()
+
+    if "virgin" in s and "plastic" in s:
+        return "virgin_plastic_absolute"
+
+    if "recycled" in s:
+        return "recycled_content"
+
+    if "reusable" in s or "recyclable" in s or "compostable" in s:
+        return "rrc_packaging"
+
+    return "packaging_general"
+    
 def calculate_risk(json_data):
     """
     核心風險計算函式 (移植自 app_bk.py)
@@ -89,7 +121,7 @@ def calculate_risk(json_data):
     groups = defaultdict(list)
     for e in entries:
         groups[(e['focus'], e['metric'], e['norm_scope'])].append(e)
-
+    
     for key, lst in groups.items():
         # 先按 Report_Year 升序排列，缺年者放到最後（維持原始順序）
         lst_with_year = [e for e in lst if e['report_year'] is not None]
@@ -109,8 +141,9 @@ def calculate_risk(json_data):
                 change_notes_by_index[cur['idx']] = f"; 目標已變更 (前: {prev_ty}年 {prev_tv} -> 現: {cur_ty}年 {cur_tv})"
                 if prev_by != cur_by:
                     change_notes_by_index[cur['idx']] += f"; 基準年已變更 (前: {prev_by} -> 現: {cur_by})"
-            elif (prev_ty != cur_ty) or (prev_tv != cur_tv):
-                change_notes_by_index[cur['idx']] = f"目標已變更 (前: {prev_ty}年 {prev_tv} -> 現: {cur_ty}年 {cur_tv})"
+            elif prev_by != cur_by:
+                change_notes_by_index[cur['idx']] = f"基準年已變更 (前: {prev_by} -> 現: {cur_by})"
+    # --- 主要計算流程 ---
     
     for idx, item in enumerate(json_data):
         try:
@@ -315,6 +348,7 @@ def calculate_risk(json_data):
 
     return pd.DataFrame(results), warnings
 
+
 def get_audit_prompt(current_year, content):
     # 注意：這裡使用 {{ }} 來轉義 JSON 的大括號，以便 f-string 正確運作
     template = f"""
@@ -370,27 +404,38 @@ def get_audit_prompt(current_year, content):
      - `Safety` (工傷率/安全事故)
      - `Human Rights Audit` (人權盡職調查)
    - **Typical Scopes**: `Global Workforce`, `Management Roles`, `Tier 1 Suppliers`
-
 # Task 2: Data Cleaning Rules (資料清洗規則)
-1. **忽略歷史數據**: 請忽略所有小於或等於 {current_year} 的進度數值 (Results/Status)，我們只關心「未來的目標 (Target)」。
+1. **忽略歷史數據**: 請忽略所有小於或等於 2022 的進度數值 (Results/Status)，我們只關心「未來的目標 (Target)」。
 2. **Deadline Logic**:
    - 優先檢查目標描述內的年份 (如 "by 2025")。
    - 若無，則使用表頭年份 (如 "2030 Target")。
 3. **Value Parsing**: 只提取目標數值 (如 "100%", "50%")，去除文字敘述。
+4. **Baseline Logic (基準年判定策略)**:
+   - **直接描述**: 優先檢查目標文字中是否包含 "vs. 20XX baseline" 或 "from a 20XX base"。
+   - **註腳關聯 (Footnote & Superscript)**: 檢查目標文字或**該區塊標題**旁邊是否有上標數字 (如 `[1]`, `1`)。若有，請務必檢索表格底部或頁尾的註腳文字 (Footnotes/Comments)，通常基準年會定義在那裡 (例如 "Measured versus a 2020 baseline")。
+   - **層級繼承 (Hierarchy Inheritance)**: 若該指標 (e.g., Recycled Content) 屬於一個大目標 (Parent Goal, e.g., Virgin Plastic Reduction) 的子項，且大目標或區塊標題有明確基準年，請**繼承**該基準年。
+   - **最後手段**: 若以上皆無，才考慮使用 Progress_History 中最早那年 - 1。
 
 # Output JSON Schema
 請輸出一個 JSON List：
 [
   {{
     "Report_Year": {current_year},
-    "Standardized_Focus_Area": "String (e.g., 'Packaging', 'Climate')",
+"Standardized_Focus_Area": "String (e.g., 'Packaging', 'Climate')",
     "Standardized_Metric": "String (e.g., 'Recycled Content')",
-    "// Level 3: 適用範疇/材質
-    // 注意：對於 Climate 領域，請忽略 "(Taiwan Operations)" 等地區後綴，只輸出標準範疇 (如 "Scope 1+2")
-    "Scope": "String (e.g., 'Plastic Packaging', 'Scope 1+2', 'Scope 3')",
+    
+    // Level 3: 適用範疇/材質
+    // 規則：
+    // 1. 優先從註腳或標題提取主要範疇 (如 "Primary plastic packaging")。
+    // 2. 若 Original_Goal_Text 中明確提及衡量方式 (如 "absolute tonnage", "per serving")，請務必補充在括號內。
+    // 範例輸入: "Reduce absolute tonnage... of primary plastic" -> 輸出: "Primary plastic packaging (absolute tonnage)"
+    "Scope": "String",
+    
     "Original_Goal_Text": "String (保留報告中的完整原始描述)",
     "Target_Deadline": Number (e.g., 2025, 2030),
     "Target_Value": "String (e.g., '25%', '50%', 'Net Zero')",
+    
+    // Baseline 提取注意：請務必檢查上標(superscript)對應的註腳，或大標題的基準年設定
     "Baseline_Year": "String (若有提及基準年則填入，否則 null)",
     "Progress_History": [
        {{ "Year": Number, "Value": "String" }}
