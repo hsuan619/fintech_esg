@@ -1,0 +1,34 @@
+多目錄文件樹報告
+產生時間: 2025-12-16 13:16:55
+(全域忽略規則: .env, .git, .idea, .json, .pdf, .vscode, __pycache__, build, dist, node_modules, process_files.py, test, train, val, venv)
+==================================================
+
+
+==================== 目錄樹: D:\碩一\金融科技\比賽\pepsico ====================
+pepsico
+├── core
+│   ├── cleaning.py
+│   ├── gemini_client.py
+│   ├── pdf_extractor.py
+│   ├── prompt.py
+│   ├── risk.py
+│   └── __init__.py
+├── memory-bank
+│   ├── architecture.md
+│   └── progress.md
+├── ui
+│   ├── tab_generate_prompt.py
+│   ├── tab_pdf_to_json.py
+│   ├── tab_pdf_to_md.py
+│   ├── tab_risk_assessment.py
+│   └── __init__.py
+├── all_files.txt
+├── app.py
+├── app_bk1215.py
+├── esg_goal_miner.py
+├── note.md
+├── pepsico.zip
+├── pp.py
+├── prompt.txt
+├── requirements.txt
+└── trees.txt

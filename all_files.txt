@@ -1,0 +1,2454 @@
+檔案整合報告
+目標目錄: D:\碩一\金融科技\比賽\pepsico
+目標副檔名: .py, .yaml, .md
+產生時間: 2025-12-16 13:16:55
+==================================================
+
+
+==================== 開始處理目錄: D:\碩一\金融科技\比賽\pepsico ====================
+
+----------- .\app.py -----------
+
+import streamlit as st
+
+from ui import tab_pdf_to_json, tab_risk_assessment
+
+
+# 設定頁面配置 (必須是第一個 Streamlit 指令)
+st.set_page_config(page_title="ESG 目標探勘者", layout="wide", page_icon="🌱")
+
+# ==========================================
+# Streamlit 網頁介面 (Web Interface)
+# ==========================================
+
+st.title("🌱 ESG-Goal-Miner｜ESG 目標探勘者")
+st.markdown(
+    """
+本工具提供從 **PDF 報告→目標 JSON** 到 **績效風險稽核** 的一站式流程。  
+步驟 1：上傳 PDF 自動擷取承諾目標；步驟 2：上傳 JSON 進行績效追蹤與風險評估。
+"""
+)
+
+# 建立兩個主要頁籤
+tab1, tab2 = st.tabs(
+    [
+        "📄 1. 上傳報告並產出目標 JSON (PDF → JSON)",
+        "📊 2. 績效追蹤與風險評估",
+    ]
+)
+
+# ------------------------------------------
+# Tab 1: 報告上傳與目標擷取 (PDF -> JSON)
+# ------------------------------------------
+with tab1:
+    tab_pdf_to_json.render()
+
+# ------------------------------------------
+# Tab 2: 績效追蹤與風險評估 (核心邏輯區)
+# ------------------------------------------
+with tab2:
+    tab_risk_assessment.render()
+
+
+----------- .\app_bk1215.py -----------
+
+import streamlit as st
+import tempfile
+import os
+import re
+import pandas as pd
+import json
+import ast
+from datetime import datetime
+from markitdown import MarkItDown  # 需安裝: pip install markitdown
+
+# 設定頁面配置 (必須是第一個 Streamlit 指令)
+st.set_page_config(page_title="ESG 漂綠稽核小幫手", layout="wide", page_icon="🌱")
+
+# ==========================================
+# 核心邏輯區 (移植自 app_bk.py 並增強)
+# ==========================================
+
+def clean_year(value):
+    """將輸入轉換為年份整數 (e.g. '2015' -> 2015)"""
+    try:
+        if pd.isna(value) or value == 'None' or value is None: 
+            return None
+        # 處理可能的浮點數年份或字串
+        return int(float(str(value).split('.')[0]))
+    except:
+        return None
+def clean_value(value):
+    """
+    通用數值清洗 (修復版)：
+    1. 修復誤判括號為負數的問題 (例如 "Scope (3)" 不應被視為負數)。
+    2. 修復數值黏連問題 (例如 "100 tCO2" 不應變 "1002")。
+    3. 支援會計負數格式 (例如 "(5)" -> -5)。
+    """
+    try:
+        if pd.isna(value) or str(value).lower() == 'none': 
+            return None, False, False
+            
+        str_val = str(value).strip()
+        
+        # 1. 判斷百分比
+        is_percentage = '%' in str_val
+        
+        # 2. 暫時移除 % 以便後續處理數值 (避免干擾數字提取)
+        temp_str = str_val.replace('%', '').strip()
+        
+        # 3. 判斷是否為會計負數格式 (括號包住純數字)，例如 (5), (1,000.5)
+        # 嚴格檢查：括號內只能有數字、逗號、小數點，且必須佔據整個字串(或去頭去尾後)
+        accounting_pattern = r'^\s*\(\s*([\d,.]+)\s*\)\s*$'
+        accounting_match = re.match(accounting_pattern, temp_str)
+        
+        is_negative_format = False
+        float_val = 0.0
+        
+        if accounting_match:
+            # 確實是 (5) 這種格式 -> 視為負數
+            is_negative_format = True
+            clean_str = accounting_match.group(1).replace(',', '')
+            float_val = -abs(float(clean_str))
+        else:
+            # 一般格式 extraction
+            # 尋找字串中「第一個」符合數值格式的部分
+            # 規則: (開頭/空白/括號) + (可選負號) + 數字(含逗號) + (可選小數點)
+            # 這樣可以避免抓到 tCO2 中的 2
+            extract_pattern = r'(?:^|[\s\(\[])([-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?)'
+            match = re.search(extract_pattern, temp_str)
+            
+            if match:
+                clean_str = match.group(1).replace(',', '')
+                float_val = float(clean_str)
+                # 這裡不自動轉負數，除非 extract 到的本身就有負號
+            else:
+                return None, False, False
+
+        # 4. 處理百分比數值
+        if is_percentage:
+            return float_val / 100, True, is_negative_format
+        
+        return float_val, False, is_negative_format
+
+    except Exception:
+        return None, False, False
+    
+def normalize_packaging_scope(scope):
+    s = scope.lower().strip()
+
+    if "virgin" in s and "plastic" in s:
+        return "virgin_plastic_absolute"
+
+    if "recycled" in s:
+        return "recycled_content"
+
+    if "reusable" in s or "recyclable" in s or "compostable" in s:
+        return "rrc_packaging"
+
+    return "packaging_general"
+    
+def calculate_risk(json_data):
+    """
+    核心風險計算函式 (移植自 app_bk.py)
+    支援: 線性預期法、距離目標法、絕對值動態轉百分比
+    回傳: (DataFrame, 警告列表)
+    """
+    results = []
+    warnings = []  # 追蹤需要顯示警告的記錄
+
+    # --- 預處理：為每筆資料判斷是否與同組的前一筆 target 不同 ---
+    from collections import defaultdict
+    change_notes_by_index = {}
+    entries = []
+    for idx, it in enumerate(json_data):
+        f = it.get('Standardized_Focus_Area', 'Unknown')
+        m = it.get('Standardized_Metric', 'Unknown')
+        s = it.get('Scope', 'Global')
+        norm_s = it.get('Normalize_Scope') or it.get('Normalized_Scope') or it.get('NormalizedScope') or it.get('Standardized_Scope') or s
+        ry = clean_year(it.get('Report_Year'))
+        ty = clean_year(it.get('Target_Deadline'))
+        tv = it.get('Target_Value')
+        by = clean_year(it.get('Baseline_Year'))
+        entries.append({'idx': idx, 'focus': f, 'metric': m, 'norm_scope': norm_s, 'report_year': ry, 'target_year': ty, 'target_val': tv, 'baseline_year': by})
+
+    groups = defaultdict(list)
+    for e in entries:
+        groups[(e['focus'], e['metric'], e['norm_scope'])].append(e)
+    
+    for key, lst in groups.items():
+        # 先按 Report_Year 升序排列，缺年者放到最後（維持原始順序）
+        lst_with_year = [e for e in lst if e['report_year'] is not None]
+        lst_no_year = [e for e in lst if e['report_year'] is None]
+        lst_sorted = sorted(lst_with_year, key=lambda x: x['report_year']) + lst_no_year
+        for i in range(1, len(lst_sorted)):
+            prev = lst_sorted[i-1]
+            cur = lst_sorted[i]
+            prev_ty = prev.get('target_year')
+            prev_tv = prev.get('target_val')
+            cur_ty = cur.get('target_year')
+            cur_tv = cur.get('target_val')
+            prev_by = prev.get('baseline_year')
+            cur_by = cur.get('baseline_year')
+            # 先比較 target（deadline 或 value），若 target 相同再比較 baseline year
+            if (prev_ty != cur_ty) or (prev_tv != cur_tv):
+                change_notes_by_index[cur['idx']] = f"; 目標已變更 (前: {prev_ty}年 {prev_tv} -> 現: {cur_ty}年 {cur_tv})"
+                if prev_by != cur_by:
+                    change_notes_by_index[cur['idx']] += f"; 基準年已變更 (前: {prev_by} -> 現: {cur_by})"
+            elif prev_by != cur_by:
+                change_notes_by_index[cur['idx']] = f"基準年已變更 (前: {prev_by} -> 現: {cur_by})"
+    # --- 主要計算流程 ---
+    
+    for idx, item in enumerate(json_data):
+        try:
+            # --- A. 基礎資料讀取 ---
+            focus_area = item.get('Standardized_Focus_Area', 'Unknown')
+            metric = item.get('Standardized_Metric', 'Unknown')
+            scope = item.get('Scope', 'Global')
+            report_year = clean_year(item.get('Report_Year'))
+            
+            # 讀取目標 (Target)
+            target_year = clean_year(item.get('Target_Deadline'))
+            target_val_str = item.get('Target_Value')
+            # 優先嘗試可能的標準化 scope 欄位
+            norm_scope = item.get('Normalize_Scope') or item.get('Normalized_Scope') or item.get('NormalizedScope') or item.get('Standardized_Scope') or scope
+            # 從預處理結果中取得變更備註（若有）
+            change_note = change_notes_by_index.get(idx, "")
+            
+            # 讀取基準年 (Baseline)
+            base_year = clean_year(item.get('Baseline_Year'))
+            
+            # 目標通常是百分比，強制視為百分比處理
+            target_reduction, _, _ = clean_value(target_val_str)
+            
+            # 如果目標沒寫%，但數值比如是 20，通常指 20% (0.2)
+            if target_reduction is not None and target_reduction > 1: 
+                target_reduction /= 100
+            
+            # --- B. 解析進度歷史 (Progress History) ---
+            history_str = item.get('Progress_History', '[]')
+            try:
+                if isinstance(history_str, list):
+                    history_list = history_str
+                else:
+                    history_list = ast.literal_eval(history_str)
+            except:
+                history_list = []
+            
+            if not history_list:
+                results.append({
+                    "Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year,
+                    "Risk_Level": "數據不足", "Analysis_Note": "無歷史進度數據", "Target": f"{target_year}年 {target_val_str}",
+                    "Has_Negative_Warning": False,
+                    "Target_Change_Note": change_note
+                })
+                continue
+            
+            # 整理歷史數據
+            history_map = {}
+            valid_history = []
+            has_negative_warning = False  # 追蹤是否有負數警告
+            
+            for h in history_list:
+                y = clean_year(h.get('Year'))
+                raw_v = h.get('Value')
+                v, is_pct, is_negative_fmt = clean_value(raw_v)
+                
+                if y is not None and v is not None:
+                    record = {'Year': y, 'Value': v, 'Is_Pct': is_pct, 'Raw': raw_v, 'Is_Negative_Fmt': is_negative_fmt}
+                    valid_history.append(record)
+                    history_map[y] = record
+                    # 如果最新年份有負數格式警告
+                    if is_negative_fmt:
+                        has_negative_warning = True
+            
+            if not valid_history:
+                results.append({
+                    "Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year, "Scope": scope,
+                    "Risk_Level": "數據不足", "Note": "無歷史進度數據", "Target": f"{target_year}年 {target_val_str}",
+                    "Current_Status": "N/A",
+                    "Has_Negative_Warning": False, "Target_Change_Note": change_note, "Analysis_Note": ""
+                })
+                continue
+            
+            valid_history.sort(key=lambda x: x['Year'])
+            latest_record = valid_history[-1]
+            Y_current = latest_record['Year']
+            
+            # 如果缺少基準年，但有歷史數據，顯示該年度的減量狀況
+            if base_year is None:
+                actual_reduction = latest_record['Value']
+                results.append({
+                    "Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year, "Scope": scope,
+                    "Risk_Level": "數據不足",  "Target": f"{target_year}年 {target_val_str}",
+                    "Current_Status": f"{Y_current}年 (減量 {actual_reduction:.1%})" if actual_reduction is not None else "N/A",
+                    "Has_Negative_Warning": False, "Target_Change_Note": change_note, "Analysis_Note": "無法計算風險（缺少基準年）"
+                })
+                continue
+            
+            # --- C. 計算實際減量 (Actual Reduction) ---
+            actual_reduction = 0.0
+            calc_method = ""
+            
+            # 判斷是用「絕對值」算還是直接拿「百分比」
+            if not latest_record['Is_Pct']:
+                # 情境 1: 歷史數據是「絕對數值」(Absolute Value)
+                if base_year in history_map:
+                    base_val = history_map[base_year]['Value']
+                    curr_val = latest_record['Value']
+                    
+                    if base_val != 0:
+                        # 公式: (基準 - 現在) / 基準
+                        actual_reduction = (base_val - curr_val) / base_val
+                        calc_method = f"絕對值計算 (基準{base_year}: {base_val:,.0f} -> {Y_current}: {curr_val:,.0f})"
+                    else:
+                        results.append({"Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year, "Risk_Level": "數據錯誤", "Analysis_Note": "基準年排放量為 0", "Has_Negative_Warning": False, "Target_Change_Note": change_note})
+                        continue
+                else:
+                    results.append({
+                        "Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year,
+                        "Risk_Level": "數據不足", "Target": f"{target_year}年 {target_val_str}",
+                        "Analysis_Note": f"歷史數據為絕對值，但在 History 中找不到基準年 ({base_year}) 的數據。",
+                        "Has_Negative_Warning": False,
+                        "Target_Change_Note": change_note
+                    })
+                    continue
+            else:
+                # 情境 2: 歷史數據本身就是「減量百分比」
+                actual_reduction = latest_record['Value']
+                calc_method = "直接讀取百分比"
+
+            # --- D. 核心演算法 (Risk Logic) ---
+            total_years = target_year - base_year
+            elapsed_years = Y_current - base_year
+
+            if total_years <= 0:
+                results.append({"Focus_Area": focus_area, "Metric": metric, "Report_Year": report_year, "Risk_Level": "設定錯誤", "Analysis_Note": "目標年早於基準年", "Has_Negative_Warning": False, "Target_Change_Note": change_note})
+                continue
+            
+            elapsed_years = max(0, elapsed_years)
+
+            # 方法一：線性預期進度法
+            expected_progress = (elapsed_years / total_years) * target_reduction
+            
+            if expected_progress > 0:
+                gap = (expected_progress - actual_reduction) / expected_progress
+            else:
+                gap = 0
+            
+            flag1 = gap > 0.1 # 落後 10% 以上
+            flag3 = gap > 1.0 # 落後 100% 以上
+
+            # 方法二：距離目標法
+            time_ratio = elapsed_years / total_years
+            target_ratio = actual_reduction / target_reduction if target_reduction > 0 else 0
+            
+            flag2 = (time_ratio >= 0.5 and target_ratio < 0.5)
+
+            # --- E. 風險判定 ---
+            if (flag1 and flag2) or flag3:
+                risk_level = "🔴 高度風險"
+            elif flag1 or flag2:
+                risk_level = "🟠 中度風險"
+            else:
+                risk_level = "🟢 低風險"
+
+            # --- F. 產生備註 ---
+            if risk_level.startswith("🟢"):
+                note = f"進度符合預期。{calc_method}"
+            else:
+                note = (
+                    f"應減 {expected_progress:.1%}, 實減 {actual_reduction:.1%} (Gap: {gap:.1%})。 "
+                    f"{calc_method}"
+                )
+
+
+            result_item = {
+                "Focus_Area": focus_area,
+                "Report_Year": report_year,
+                "Metric": metric,
+                "Scope": scope,
+                "Target": f"{target_year}年 {target_val_str}",
+                "Current_Status": f"{Y_current}年 (減量 {actual_reduction:.1%})",
+                "Risk_Level": risk_level,
+                "Analysis_Note": note,
+                "Has_Negative_Warning": has_negative_warning and actual_reduction < 0,
+                "Target_Change_Note": change_note
+            }
+            results.append(result_item)
+            
+            # 如果有負數警告，添加到警告列表
+            if result_item["Has_Negative_Warning"]:
+                warnings.append({
+                    "Focus_Area": focus_area,
+                    "Metric": metric,
+                    "Year": Y_current,
+                    "Status": actual_reduction
+                })
+
+        except Exception as e:
+            results.append({
+                "Focus_Area": item.get('Standardized_Focus_Area'),
+                "Metric": item.get('Standardized_Metric'),
+                "Report_Year": item.get('Report_Year'),
+                "Risk_Level": "計算錯誤",
+                "Note": str(e),
+                "Current_Status": "N/A",
+                "Target": "N/A",
+                "Analysis_Note": "N/A",
+                "Scope": "N/A",
+                "Has_Negative_Warning": False
+            })
+
+    return pd.DataFrame(results), warnings
+
+
+def get_audit_prompt(current_year, content):
+    # 注意：這裡使用 {{ }} 來轉義 JSON 的大括號，以便 f-string 正確運作
+    template = f"""
+# Role
+你是一位精通 ESG 報告標準 (如 GRI, SASB) 的稽核員。你的任務是從企業永續報告書中提取「承諾目標」，並依據內建的標準化字典進行分類，以便進行跨年度數據比對。
+
+# Context
+**目前正在處理的報告年份**: {current_year}
+
+# Input Data
+你將解析提供的表格圖片或文字。這些數據來自上述年份的永續報告書。
+
+# Task 1: Extraction & Standardization (提取與標準化)
+請將提取出的目標映射到以下的標準化階層結構。如果不完全匹配，請選擇語意最接近的選項。
+
+## 📚 Standardized ESG Dictionary (標準化字典)
+
+### 1. 🌍 Focus Area: Climate (氣候變遷)
+   - **Target Metrics**: 
+     - `Absolute GHG Reduction` (溫室氣體絕對減量)
+     - `Net Zero` (淨零排放)
+     - `Renewable Energy` (再生能源比例)
+     - `Energy Efficiency` (能源使用效率)
+   - **Typical Scopes**: `Scope 1+2`, `Scope 3`, `Value Chain`, `Global Operations`
+   - **Strict Formatting Rule**: 
+     - 當目標涉及 Scope 1 與 Scope 2 時，Output Scope 欄位請**嚴格**填入 `Scope 1+2`。
+     - **禁止**在 Scope 欄位加入地區、子公司或括號註記 (例如：**不要寫** `Scope 1+2 (Taiwan Operations)` 或 `Scope 1+2 (Company only)`，一律刪除括號內容，只保留 `Scope 1+2`)。
+
+### 2. 📦 Focus Area: Packaging (包裝與循環經濟)
+   - **Target Metrics**: 
+     - `Recycled Content` (再生料使用比例, e.g., rPET)
+     - `Virgin Plastic Reduction` (原生塑膠減量)
+     - `Packaging Design` (可回收/可堆肥設計, e.g., Recyclability)
+     - `Reuse Models` (重複使用模式/減量)
+     - `Waste to Landfill` (廢棄物掩埋率)
+   - **Typical Scopes**: `Plastic Packaging`, `Beverage Containers`, `Food Packaging`, `Global Portfolio`
+
+### 3. 💧 Focus Area: Water (水資源)
+   - **Target Metrics**: 
+     - `Water Replenishment` (水資源回補)
+     - `Water Use Efficiency` (用水效率/強度)
+   - **Typical Scopes**: `High Water-Risk Areas`, `Manufacturing Operations`
+
+### 4. 🌱 Focus Area: Agriculture (永續農業)
+   - **Target Metrics**: 
+     - `Regenerative Agriculture` (再生農業採用面積)
+     - `Sustainably Sourced` (永續採購比例)
+   - **Typical Scopes**: `Key Ingredients`, `Direct Supply Chain`
+
+### 5. 👥 Focus Area: Human Rights & Social (人權與社會)
+   - **Target Metrics**: 
+     - `Gender Diversity` (性別多樣性/管理層比例)
+     - `Safety` (工傷率/安全事故)
+     - `Human Rights Audit` (人權盡職調查)
+   - **Typical Scopes**: `Global Workforce`, `Management Roles`, `Tier 1 Suppliers`
+# Task 2: Data Cleaning Rules (資料清洗規則)
+1. **忽略歷史數據**: 請忽略所有小於或等於 2022 的進度數值 (Results/Status)，我們只關心「未來的目標 (Target)」。
+2. **Deadline Logic**:
+   - 優先檢查目標描述內的年份 (如 "by 2025")。
+   - 若無，則使用表頭年份 (如 "2030 Target")。
+3. **Value Parsing**: 只提取目標數值 (如 "100%", "50%")，去除文字敘述。
+4. **Baseline Logic (基準年判定策略)**:
+   - **直接描述**: 優先檢查目標文字中是否包含 "vs. 20XX baseline" 或 "from a 20XX base"。
+   - **註腳關聯 (Footnote & Superscript)**: 檢查目標文字或**該區塊標題**旁邊是否有上標數字 (如 `[1]`, `1`)。若有，請務必檢索表格底部或頁尾的註腳文字 (Footnotes/Comments)，通常基準年會定義在那裡 (例如 "Measured versus a 2020 baseline")。
+   - **層級繼承 (Hierarchy Inheritance)**: 若該指標 (e.g., Recycled Content) 屬於一個大目標 (Parent Goal, e.g., Virgin Plastic Reduction) 的子項，且大目標或區塊標題有明確基準年，請**繼承**該基準年。
+   - **最後手段**: 若以上皆無，才考慮使用 Progress_History 中最早那年 - 1。
+
+# Output JSON Schema
+請輸出一個 JSON List：
+[
+  {{
+    "Report_Year": {current_year},
+"Standardized_Focus_Area": "String (e.g., 'Packaging', 'Climate')",
+    "Standardized_Metric": "String (e.g., 'Recycled Content')",
+    
+    // Level 3: 適用範疇/材質
+    // 規則：
+    // 1. 優先從註腳或標題提取主要範疇 (如 "Primary plastic packaging")。
+    // 2. 若 Original_Goal_Text 中明確提及衡量方式 (如 "absolute tonnage", "per serving")，請務必補充在括號內。
+    // 範例輸入: "Reduce absolute tonnage... of primary plastic" -> 輸出: "Primary plastic packaging (absolute tonnage)"
+    "Scope": "String",
+    
+    "Original_Goal_Text": "String (保留報告中的完整原始描述)",
+    "Target_Deadline": Number (e.g., 2025, 2030),
+    "Target_Value": "String (e.g., '25%', '50%', 'Net Zero')",
+    
+    // Baseline 提取注意：請務必檢查上標(superscript)對應的註腳，或大標題的基準年設定
+    "Baseline_Year": "String (若有提及基準年則填入，否則 null)",
+    "Progress_History": [
+       {{ "Year": Number, "Value": "String" }}
+    ]
+  }}
+]
+
+# Begin Extraction
+請分析以下內容：
+{content}
+"""
+    return template
+
+# ==========================================
+# 3. Streamlit 網頁介面 (Web Interface)
+# ==========================================
+
+st.title("🌱 ESG 報告書漂綠稽核小幫手")
+st.markdown("""
+本工具提供從 **PDF 報告轉換** 到 **績效風險稽核** 的一站式流程。
+請依序使用下方分頁功能：
+""")
+
+# 建立三個主要頁籤
+tab1, tab2, tab3 = st.tabs([
+    "📄 1. 報告轉換 (PDF to MD)", 
+    "🤖 2. 產生稽核 Prompt", 
+    "📊 3. 績效追蹤與風險評估"
+])
+
+# ------------------------------------------
+# Tab 1: 報告轉換 (PDF -> Markdown)
+# ------------------------------------------
+with tab1:
+    st.header("步驟一：上傳並轉換報告書")
+    st.markdown("將 PDF 格式的 ESG 報告書轉換為 AI 可讀的 Markdown 格式。")
+    
+    uploaded_pdf = st.file_uploader("上傳 ESG 報告書 (PDF)", type=["pdf"], key="pdf_uploader")
+    
+    # 狀態保存：Markdown 內容
+    if 'markdown_content' not in st.session_state:
+        st.session_state.markdown_content = ""
+    
+    # 嘗試從檔名自動提取年份
+    default_year = 2024
+    if uploaded_pdf:
+        match = re.search(r'20\d{2}', uploaded_pdf.name)
+        if match:
+            default_year = int(match.group(0))
+            
+    report_year = st.number_input("設定報告年份", min_value=2000, max_value=2030, value=default_year, key="report_year_input")
+    st.session_state.report_year = report_year
+
+    if uploaded_pdf is not None:
+        if st.button("開始轉換"):
+            st.info(f"正在處理檔案: {uploaded_pdf.name} ...")
+            
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                tmp_pdf.write(uploaded_pdf.read())
+                tmp_pdf_path = tmp_pdf.name
+
+            try:
+                md = MarkItDown()
+                result = md.convert(tmp_pdf_path)
+                st.session_state.markdown_content = result.text_content
+                os.remove(tmp_pdf_path)
+                st.success("轉換成功！請至「產生稽核 Prompt」分頁查看。")
+                
+            except Exception as e:
+                st.error(f"轉換錯誤: {e}")
+                if os.path.exists(tmp_pdf_path): os.remove(tmp_pdf_path)
+    
+    if st.session_state.markdown_content:
+        with st.expander("查看轉換後的 Markdown 內容"):
+            st.text_area("內容預覽", st.session_state.markdown_content, height=300)
+            st.download_button(
+                label="下載 Markdown (.md)",
+                data=st.session_state.markdown_content,
+                file_name=f"report_{report_year}.md",
+                mime="text/markdown"
+            )
+
+# ------------------------------------------
+# Tab 2: 產生稽核 Prompt
+# ------------------------------------------
+with tab2:
+    st.header("步驟二：生成 AI 稽核 Prompt")
+    st.markdown("將轉換後的內容結合標準化指令，產生可供 ChatGPT/Claude/Gemini 使用的 Prompt。")
+    
+    if st.session_state.markdown_content:
+        final_prompt = get_audit_prompt(st.session_state.report_year, st.session_state.markdown_content)
+        
+        st.info("💡 請複製下方內容，貼給 LLM 模型，並將其回傳的 JSON 存檔供步驟三使用。")
+        st.text_area("Prompt 預覽", final_prompt, height=400)
+        
+        st.download_button(
+            label="下載完整 Prompt (.txt)",
+            data=final_prompt,
+            file_name=f"Audit_Prompt_{st.session_state.report_year}.txt",
+            mime="text/plain"
+        )
+    else:
+        st.warning("請先在步驟一上傳並轉換 PDF 報告。")
+
+# ------------------------------------------
+# Tab 3: 績效追蹤與風險評估 (核心邏輯區)
+# ------------------------------------------
+with tab3:
+    st.header("步驟三：績效追蹤與風險評估")
+    st.markdown("""
+    請上傳由 LLM 產出的 **結構化 JSON 檔案**。
+    系統將自動執行：
+    1. **解析歷年數據** (支援絕對值轉百分比，自動將 `(5)%` 轉為 `-5%`)。
+    2. **對應基準年** (Baseline Mapping)。
+    3. **計算風險等級** (線性預期法 + 距離目標法)。
+    """)
+    
+    uploaded_json = st.file_uploader("上傳 LLM 產出的 JSON 檔案", type=["json"], key="json_uploader")
+
+    if uploaded_json is not None:
+        try:
+            # 讀取 JSON
+            json_data = json.load(uploaded_json)
+            st.success(f"成功讀取檔案！共 {len(json_data)} 筆目標資料。")
+            
+            # 執行計算
+            with st.spinner('正在進行風險評估演算法...'):
+                df_result, warnings_list = calculate_risk(json_data)
+            
+            # 顯示警告彈窗 (Current_Status 背道而馳)
+            if warnings_list:
+                for warn in warnings_list:
+                    st.error(
+                        f"❌年度: {warn['Year']} - {warn['Focus_Area']} - {warn['Metric']}\n\n"
+                        f"該年度的減量狀況為負數 ({warn['Status']:.1%})，"
+                        f"與目標背道而馳！"
+                    )
+
+            # 顯示結果
+            st.subheader("📊 稽核分析結果")
+
+            # 直接顯示表格（隱藏內部欄位 Has_Negative_Warning）
+            df_display = df_result.drop(columns=['Has_Negative_Warning'], errors='ignore')
+            # 依 Report_Year 預設升序排序（若有此欄位）
+            if 'Report_Year' in df_display.columns:
+                try:
+                    df_display = df_display.sort_values(by='Report_Year', ascending=True)
+                except Exception:
+                    pass
+            st.dataframe(df_display, use_container_width=True)
+
+            # 下載 CSV
+            # 在導出前移除 Has_Negative_Warning 列
+            df_export = df_result.drop(columns=['Has_Negative_Warning'], errors='ignore')
+            csv = df_export.to_csv(index=False, encoding='utf-8-sig')
+            base_name = uploaded_json.name.replace(".json", "")
+            file_name = f"Audit_Result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{base_name}.csv"
+            
+            st.download_button(
+                label="📥 下載完整分析報表 (CSV)",
+                data=csv,
+                file_name=file_name,
+                mime="text/csv",
+            )
+
+        except Exception as e:
+            st.error(f"分析過程發生錯誤: {e}")
+            st.info("請確認上傳的 JSON 格式是否符合 Prompt 定義的 Schema。")
+    else:
+        st.info("👋 等待上傳 JSON 檔案中...")
+
+----------- .\esg_goal_miner.py -----------
+
+"""
+ESG-Goal-Miner
+===============
+
+用法（CLI）:
+
+    cd pepsico
+    python esg_goal_miner.py --pdf pdf/2023-ESG-Performance-Metrics.pdf --year 2023 --output All_json/2023.json
+
+輸入:
+    - 一份 ESG PDF 報告
+    - 報告年份 current_year（手動指定，避免自動判斷出錯）
+
+輸出:
+    - 一個 JSON 檔案，內容為整份報告所有頁面中偵測到的「承諾目標」列表。
+      結構遵守 core.prompt.get_audit_prompt 定義的 Schema。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Dict, List
+
+from core.gemini_client import GeminiClient
+from core.pdf_extractor import extract_mixed_content
+
+
+def run_esg_goal_miner(pdf_path: Path, report_year: int, output_path: Path) -> None:
+    pages = extract_mixed_content(str(pdf_path))
+
+    client = GeminiClient()
+    all_items: List[Dict[str, Any]] = []
+
+    for page in pages:
+        text: str = page["text"]
+        images: List[bytes] = page["images"]
+
+        page_items = client.extract_goals_from_page(
+            page_text=text,
+            images=images,
+            current_year=report_year,
+        )
+
+        for item in page_items:
+            if isinstance(item, dict):
+                item.setdefault("Report_Year", report_year)
+                all_items.append(item)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(all_items, f, ensure_ascii=False, indent=2)
+
+    print(f"[ESG-Goal-Miner] 共寫出 {len(all_items)} 筆目標至: {output_path}")
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="ESG-Goal-Miner: 從 ESG PDF 報告自動抽取承諾目標為 JSON")
+    parser.add_argument(
+        "--pdf",
+        type=str,
+        required=True,
+        help="輸入 PDF 檔案路徑，例如: pdf/2023-ESG-Performance-Metrics.pdf",
+    )
+    parser.add_argument(
+        "--year",
+        type=int,
+        required=True,
+        help="報告年份 (current_year)，例如 2023",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        required=True,
+        help="輸出 JSON 檔案路徑，例如: All_json/2023.json",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    pdf_path = Path(args.pdf)
+    output_path = Path(args.output)
+
+    if not pdf_path.is_file():
+        raise SystemExit(f"找不到 PDF 檔案: {pdf_path}")
+
+    run_esg_goal_miner(pdf_path=pdf_path, report_year=args.year, output_path=output_path)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+----------- .\note.md -----------
+
+##conda evn
+activate test1126
+
+
+##usage pdf to filename.md
+markitdown path-to-file.pdf -o document.md
+
+markitdown 2024-ESG-Performance-Metrics.pdf -o 2024-ESG-Performance-Metrics.md
+
+
+##跑網頁
+streamlit run app.py
+
+
+
+##部署
+https://github.com/hsuan619/fintech_esg.git
+
+----------- .\pp.py -----------
+
+import fitz  # PyMuPDF
+import google.generativeai as genai
+from typing import List, Dict, Union, Tuple
+
+def extract_content_smart(pdf_path: str, page_num: int) -> Tuple[str, List[bytes], bool]:
+    """
+    智慧提取：自動判斷是傳送文字還是傳送整頁圖片。
+    
+    Returns:
+        text_content (str): 提取的文字
+        images (List[bytes]): 圖片列表 (如果是掃描檔，這裡會包含整頁截圖)
+        is_scanned_mode (bool): 是否啟用了掃描模式 (除錯用)
+    """
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_num)
+    
+    text = page.get_text()
+    images_to_send = []
+    is_scanned_mode = False
+
+    # === 判斷邏輯 ===
+    # 如果文字太少 (例如少於 1000 字)，我們假設它是：
+    # 1. 掃描檔 (Scanned PDF)
+    # 2. 全版大圖/海報 (Infographic)
+    # 這時我們啟動「視覺模式」，把整頁轉成圖片
+    if len(text.strip()) < 1000:
+        is_scanned_mode = True
+        
+        # 將整頁渲染為高解析度圖片 (zoom=2 代表 200% 解析度，OCR 準度較高)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2)) 
+        img_bytes = pix.tobytes("png")
+        images_to_send.append(img_bytes)
+        
+        # 在掃描模式下，Text 設為提示語，告訴 AI 這是一張截圖
+        text = "[系統提示: 此頁面為掃描檔或全版圖表，請直接分析附圖內容]"
+        
+    else:
+        # === 一般模式 (文字版 PDF) ===
+        # 雖然有文字，但可能還有插圖 (Bar Chart 等)，也要抓出來
+        image_list = page.get_images(full=True)
+        for img_index, img in enumerate(image_list):
+            try:
+                xref = img[0]
+                base_image = doc.extract_image(xref)
+                images_to_send.append(base_image["image"])
+            except Exception:
+                continue # 忽略損壞的圖片
+
+    doc.close()
+    return text, images_to_send, is_scanned_mode
+
+----------- .\process_files.py -----------
+
+# -*- coding: utf-8 -*-
+
+import os
+import argparse
+from datetime import datetime
+
+# --- 全域設定: 在此處新增您想在「文件樹」中忽略的資料夾或檔案名稱 ---
+# 使用集合(set)可以提高查找效率
+IGNORED_PATTERNS = {
+    '__pycache__',  # Python 的快取資料夾 (使用者要求)
+    '.git',         # Git 版本控制資料夾
+    'venv',         # Python 虛擬環境資料夾
+    '.vscode',      # VSCode 編輯器設定資料夾
+    '.idea',        # JetBrains IDEs 設定資料夾
+    '.env',         # 環境變數檔案
+    'node_modules', # Node.js 依賴庫資料夾
+    'build',        # 編譯輸出資料夾
+    'dist',         # 打包輸出資料夾
+    'process_files.py',
+    "train",
+    "test",
+    "val",
+    ".json",
+    ".pdf"
+}
+
+
+def combine_files(directory_paths, extensions, output_file_path):
+    """
+    遞迴掃描多個指定目錄，將所有符合指定副檔名列表的檔案整合成單一文件。
+    """
+    extensions_tuple = tuple(extensions)
+    print(f"[*] 開始整合副檔名為 '{', '.join(extensions)}' 的檔案...")
+    try:
+        with open(output_file_path, 'w', encoding='utf-8') as outfile:
+            # 寫入總報告頭
+            outfile.write(f"檔案整合報告\n")
+            outfile.write(f"目標目錄: {', '.join([os.path.abspath(p) for p in directory_paths])}\n")
+            outfile.write(f"目標副檔名: {', '.join(extensions)}\n")
+            outfile.write(f"產生時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            outfile.write("="*50 + "\n")
+
+            # 遍歷每一個指定的目錄
+            for directory_path in directory_paths:
+                abs_dir_path = os.path.abspath(directory_path)
+                print(f"\n[+] 正在處理目錄: {abs_dir_path}")
+                outfile.write(f"\n\n{'='*20} 開始處理目錄: {abs_dir_path} {'='*20}\n\n")
+
+                found_files = False
+                for root, _, files in os.walk(directory_path):
+                    # 忽略被指定的資料夾
+                    if any(ignored in root.split(os.sep) for ignored in IGNORED_PATTERNS):
+                        continue
+                        
+                    for file in sorted(files):
+                        if file.endswith(extensions_tuple):
+                            found_files = True
+                            file_path = os.path.join(root, file)
+                            print(f"  -> 正在讀取: {file_path}")
+                            outfile.write(f"----------- {file_path} -----------\n\n")
+                            try:
+                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as infile:
+                                    content = infile.read()
+                                    outfile.write(content)
+                                    outfile.write("\n\n")
+                            except Exception as e:
+                                outfile.write(f"*** 無法讀取檔案: {e} ***\n\n")
+                
+                if not found_files:
+                    print(f"  -> 在 {abs_dir_path} 中未找到符合副檔名的檔案。")
+                    outfile.write(f"*** 在此目錄中未找到符合副檔名 '{', '.join(extensions)}' 的檔案 ***\n\n")
+
+
+        print(f"\n[+] 成功！所有檔案已整合至: {output_file_path}\n")
+
+    except Exception as e:
+        print(f"[!] 整合檔案時發生錯誤: {e}\n")
+
+
+def generate_tree(directory_paths, output_file_path, ignored=None):
+    """
+    為多個指定目錄產生文件樹結構，並將所有樹狀圖儲存至單一 txt 檔。
+    """
+    if ignored is None:
+        ignored = set()
+    
+    print(f"[*] 開始產生文件樹 (將忽略: {', '.join(ignored)})...")
+    try:
+        with open(output_file_path, 'w', encoding='utf-8') as f:
+            f.write(f"多目錄文件樹報告\n")
+            f.write(f"產生時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            if ignored:
+                f.write(f"(全域忽略規則: {', '.join(sorted(list(ignored)))})\n")
+            f.write("="*50 + "\n")
+
+            # 遍歷每一個指定的目錄
+            for directory_path in directory_paths:
+                abs_dir_path = os.path.abspath(directory_path)
+                print(f"\n[+] 正在為目錄產生樹狀圖: {abs_dir_path}")
+                f.write(f"\n\n{'='*20} 目錄樹: {abs_dir_path} {'='*20}\n")
+                
+                f.write(f"{os.path.basename(abs_dir_path)}\n")
+                _create_tree_recursive(f, abs_dir_path, "", ignored)
+        
+        print(f"\n[+] 成功！所有文件樹已儲存至: {output_file_path}\n")
+
+    except Exception as e:
+        print(f"[!] 產生文件樹時發生錯誤: {e}\n")
+
+
+def _create_tree_recursive(file_obj, dir_path, prefix="", ignored=None):
+    """
+    遞迴輔助函式，用來建立文件樹的每一層結構，會跳過忽略列表中的項目。
+    (此函式功能不變)
+    """
+    if ignored is None:
+        ignored = set()
+
+    try:
+        # 取得目錄下所有項目，並預先過濾掉要忽略的檔案/資料夾
+        items = [item for item in os.listdir(dir_path) if item not in ignored]
+        # 將資料夾排在前面
+        entries = sorted(items, key=lambda x: not os.path.isdir(os.path.join(dir_path, x)))
+    except OSError as e:
+        file_obj.write(f"{prefix}└── [無法存取: {e}]\n")
+        return
+
+    for i, entry in enumerate(entries):
+        connector = "└── " if i == len(entries) - 1 else "├── "
+        file_obj.write(f"{prefix}{connector}{entry}\n")
+
+        entry_path = os.path.join(dir_path, entry)
+        if os.path.isdir(entry_path):
+            new_prefix = "    " if i == len(entries) - 1 else "│   "
+            _create_tree_recursive(file_obj, entry_path, prefix + new_prefix, ignored)
+
+
+def main():
+    """
+    主函式，處理使用者輸入並執行主要功能。
+    """
+    parser = argparse.ArgumentParser(
+        description="一個強大的文件處理工具，可以整合指定副檔名的檔案，並為多個目錄產生文件樹。",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    
+    parser.add_argument(
+        "directories", 
+        nargs='+',  # 接受一個或多個值
+        help="要處理的一個或多個目標資料夾路徑，請用空格分隔。"
+    )
+    parser.add_argument(
+        "-e", "--extensions", 
+        nargs='+',
+        default=['.py', '.yaml', '.md'], 
+        help="要整合的一個或多個檔案副檔名，請用空格分隔。\n範例: -e .py .html .css (預設值: .py)"
+    )
+    parser.add_argument("-o1", "--output_combine", default="all_files.txt", help="整合後的文件名稱。(預設值: combine_files.txt)")
+    parser.add_argument("-o2", "--output_tree", default="trees.txt", help="文件樹的輸出文件名稱。(預設值: trees.txt)")
+    
+    args = parser.parse_args()
+
+    directory_paths = args.directories
+    extensions = args.extensions
+    output_combine_path = args.output_combine
+    output_tree_path = args.output_tree
+
+    # 驗證所有提供的路徑都是有效的資料夾
+    for path in directory_paths:
+        if not os.path.isdir(path):
+            print(f"[!] 錯誤：指定的路徑 '{path}' 不是一個有效的資料夾或不存在。")
+            return
+
+    # 傳入目錄列表進行處理
+    combine_files(directory_paths, extensions, output_combine_path)
+    generate_tree(directory_paths, output_tree_path, ignored=IGNORED_PATTERNS)
+    
+    print("✨ 所有任務執行完畢！ ✨")
+
+#python process_files.py ./
+
+if __name__ == "__main__":
+    main()
+
+----------- .\core\__init__.py -----------
+
+"""
+核心商業邏輯模組包：
+- cleaning: 通用清洗與前處理
+- risk: 風險計算主流程
+- prompt: LLM 稽核 Prompt 產生器
+"""
+
+
+
+
+----------- .\core\cleaning.py -----------
+
+import re
+from typing import Any, Optional, Tuple
+
+import pandas as pd
+
+
+def clean_year(value: Any) -> Optional[int]:
+    """將輸入轉換為年份整數 (e.g. '2015' -> 2015)；失敗則回傳 None。"""
+    try:
+        if pd.isna(value) or value == "None" or value is None:
+            return None
+        # 處理可能的浮點數年份或字串
+        return int(float(str(value).split(".")[0]))
+    except Exception:
+        return None
+
+
+def clean_value(value: Any) -> Tuple[Optional[float], bool, bool]:
+    """
+    通用數值清洗 (修復版)：
+    1. 修復誤判括號為負數的問題 (例如 "Scope (3)" 不應被視為負數)。
+    2. 修復數值黏連問題 (例如 "100 tCO2" 不應變 "1002")。
+    3. 支援會計負數格式 (例如 "(5)" -> -5)。
+
+    Returns:
+        (數值, 是否為百分比格式, 是否為會計負數格式)
+    """
+    try:
+        if pd.isna(value) or str(value).lower() == "none":
+            return None, False, False
+
+        str_val = str(value).strip()
+
+        # 1. 判斷百分比
+        is_percentage = "%" in str_val
+
+        # 2. 暫時移除 % 以便後續處理數值 (避免干擾數字提取)
+        temp_str = str_val.replace("%", "").strip()
+
+        # 3. 判斷是否為會計負數格式 (括號包住純數字)
+        accounting_pattern = r"^\s*\(\s*([\d,.]+)\s*\)\s*$"
+        accounting_match = re.match(accounting_pattern, temp_str)
+
+        is_negative_format = False
+        float_val = 0.0
+
+        if accounting_match:
+            # 確實是 (5) 這種格式 -> 視為負數
+            is_negative_format = True
+            clean_str = accounting_match.group(1).replace(",", "")
+            float_val = -abs(float(clean_str))
+        else:
+            # 一般格式 extraction
+            # 尋找字串中「第一個」符合數值格式的部分
+            extract_pattern = (
+                r"(?:^|[\s\(\[])([-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?)"
+            )
+            match = re.search(extract_pattern, temp_str)
+
+            if match:
+                clean_str = match.group(1).replace(",", "")
+                float_val = float(clean_str)
+            else:
+                return None, False, False
+
+        # 4. 處理百分比數值
+        if is_percentage:
+            return float_val / 100, True, is_negative_format
+
+        return float_val, False, is_negative_format
+
+    except Exception:
+        return None, False, False
+
+
+def normalize_packaging_scope(scope: str) -> str:
+    """標準化包裝相關 Scope 字串。"""
+    s = scope.lower().strip()
+
+    if "virgin" in s and "plastic" in s:
+        return "virgin_plastic_absolute"
+
+    if "recycled" in s:
+        return "recycled_content"
+
+    if "reusable" in s or "recyclable" in s or "compostable" in s:
+        return "rrc_packaging"
+
+    return "packaging_general"
+
+
+
+
+----------- .\core\gemini_client.py -----------
+
+import json
+import os
+from typing import Any, Dict, List
+
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+from .prompt import get_audit_prompt
+
+
+class GeminiClient:
+    """
+    輕量封裝 Google Gemini 1.5 Flash
+
+    - 自動從 .env / 環境變數讀取 GOOGLE_API_KEY
+    - 提供圖片前處理 (圖表文字描述)
+    - 以 JSON mode 回傳結構化結果
+    """
+
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash-lite",
+        vision_model_name: str | None = None,
+        api_key: str | None = None,
+    ) -> None:
+        load_dotenv()
+
+        api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "環境變數 GOOGLE_API_KEY 未設定，請在專案根目錄建立 .env 並加入：\n"
+                "GOOGLE_API_KEY=你的_API_Key"
+            )
+
+        genai.configure(api_key=api_key)
+
+        self._model = genai.GenerativeModel(model_name)
+        # 視覺前處理可用不同 model；若未指定則共用同一個
+        self._vision_model = (
+            genai.GenerativeModel(vision_model_name)
+            if vision_model_name
+            else self._model
+        )
+
+    def _describe_images(self, images: List[bytes]) -> str:
+        """
+        使用 Vision 模型先把圖表「翻譯成文字」，特別是抽出年度 + 數值的歷史趨勢。
+        回傳：單一長文字描述，可直接拼在 content 後面。
+        """
+        if not images:
+            return ""
+
+        parts: List[Any] = [
+            (
+                "你是一位 ESG 報告稽核員，請專注解析**圖表或趨勢圖**中的：\n"
+                "1. 目標值 (Target) 與目標年度 (例如 2025年 2,467 萬噸, 2030年 2,271 萬噸)\n"
+                "2. 歷史進度 (Results / Status)：請盡可能列出所有「年度 + 數值」的資料點\n"
+                "   - 請用類似 `2005: 2,567 萬噸`, `2006: 2,710 萬噸` 的格式逐年列出\n"
+                "3. 基準年 (Baseline) 以及與基準年的減量百分比 (若有標示，例如「比 2007 年減少 22%」)\n\n"
+                "請用條列式輸出，每個圖表一段，務必把你能看見的所有年度與數值都寫出來。"
+            )
+        ]
+
+        for img in images:
+            parts.append(
+                {
+                    "mime_type": "image/png",
+                    "data": img,
+                }
+            )
+
+        response = self._vision_model.generate_content(parts)
+        return response.text or ""
+
+    def extract_goals_from_page(
+        self,
+        *,
+        page_text: str,
+        images: List[bytes],
+        current_year: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        核心方法：給一頁 PDF 的文字 + 圖片，回傳該頁所有「承諾目標」的 JSON list。
+        """
+        image_desc = self._describe_images(images)
+
+        # 將原始文字與圖片描述合併，丟給 Prompt 模板
+        merged_content_parts: List[str] = ["# Page Text", page_text.strip()]
+        if image_desc:
+            merged_content_parts.extend(
+                [
+                    "",
+                    "# Image-derived Details",
+                    image_desc.strip(),
+                ]
+            )
+
+        merged_content = "\n".join(merged_content_parts)
+        prompt = get_audit_prompt(current_year=current_year, content=merged_content)
+
+        response = self._model.generate_content(
+            [prompt],
+            generation_config=genai.types.GenerationConfig(
+                response_mime_type="application/json"
+            ),
+        )
+
+        raw_text = response.text or "[]"
+
+        try:
+            data = json.loads(raw_text)
+        except json.JSONDecodeError:
+            # 若模型外層多包一層物件，嘗試幾個常見 key
+            try:
+                obj = json.loads(raw_text)
+                for key in ("items", "data", "results"):
+                    if key in obj and isinstance(obj[key], list):
+                        return obj[key]
+                # 如果是單一物件而非 list，就包成 list
+                if isinstance(obj, dict):
+                    return [obj]
+                if isinstance(obj, list):
+                    return obj
+            except Exception:
+                # 最後退路：直接回傳空 list，避免整體流程中斷
+                return []
+
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return data
+        return []
+
+
+__all__ = ["GeminiClient"]
+
+
+
+
+----------- .\core\pdf_extractor.py -----------
+
+from typing import Any, Dict, List
+
+# 支援兩種執行方式：
+# 1. 作為 package 匯入：  from pepsico.core.pdf_extractor import ...
+# 2. 直接在 pepsico 目錄執行：python esg_goal_miner.py
+try:
+    from ..pp import extract_content_smart  # type: ignore[import-not-found]
+except ImportError:  # 當前目錄直接執行時走這條
+    from pp import extract_content_smart  # type: ignore[import-not-found]
+
+
+def extract_mixed_content(pdf_path: str) -> List[Dict[str, Any]]:
+    """
+    Step 2: PDF 混合內容提取器
+
+    - 使用 PyMuPDF 逐頁讀取
+    - 提取純文字
+    - 提取該頁所有圖片 (bytes)
+
+    回傳格式:
+        [
+          {
+            "page_index": 0,
+            "text": "...",
+            "images": [b"...", ...],
+            "is_scanned": bool,
+          },
+          ...
+        ]
+    """
+    # extract_content_smart 內部已負責開啟與關閉 PDF
+    pages: List[Dict[str, Any]] = []
+
+    import fitz  # lazy import to keep dependency localized
+
+    doc = fitz.open(pdf_path)
+    page_count = doc.page_count
+    doc.close()
+
+    for i in range(page_count):
+        text, images, is_scanned = extract_content_smart(pdf_path, i)
+
+        # 為了確保 LLM 一定看到整張圖表/趨勢圖，
+        # 非掃描模式下再額外補上一張整頁截圖。
+        if not is_scanned:
+            doc_page = fitz.open(pdf_path).load_page(i)
+            pix = doc_page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            images.append(pix.tobytes("png"))
+
+        pages.append(
+            {
+                "page_index": i,
+                "text": text,
+                "images": images,
+                "is_scanned": is_scanned,
+            }
+        )
+
+    return pages
+
+
+
+
+----------- .\core\prompt.py -----------
+
+def get_audit_prompt(current_year: int, content: str) -> str:
+    """
+    產生 ESG 漂綠稽核用的 LLM Prompt。
+
+    參數:
+        current_year: 報告年份
+        content: Markdown 或文字形式的報告內容
+    """
+    # 注意：這裡使用 {{ }} 來轉義 JSON 的大括號，以便 f-string 正確運作
+    template = f"""
+# Role
+你是一位精通 ESG 報告標準 (如 GRI, SASB) 的稽核員。你的任務是從企業永續報告書中提取「承諾目標」，並依據內建的標準化字典進行分類，以便進行跨年度數據比對。
+
+# Context
+**目前正在處理的報告年份**: {current_year}
+
+# Input Data
+你將解析提供的表格圖片或文字。這些數據來自上述年份的永續報告書。
+
+# Task 1: Extraction & Standardization (提取與標準化)
+請將提取出的目標映射到以下的標準化階層結構。如果不完全匹配，請選擇語意最接近的選項。
+
+## 📚 Standardized ESG Dictionary (標準化字典)
+
+### 1. 🌍 Focus Area: Climate (氣候變遷)
+   - **Target Metrics**: 
+     - `Absolute GHG Reduction` (溫室氣體絕對減量)
+     - `Net Zero` (淨零排放)
+     - `Renewable Energy` (再生能源比例)
+     - `Energy Efficiency` (能源使用效率)
+   - **Typical Scopes**: `Scope 1+2`, `Scope 3`, `Value Chain`, `Global Operations`
+   - **Strict Formatting Rule**: 
+     - 當目標涉及 Scope 1 與 Scope 2 時，Output Scope 欄位請**嚴格**填入 `Scope 1+2`。
+     - **禁止**在 Scope 欄位加入地區、子公司或括號註記 (例如：**不要寫** `Scope 1+2 (Taiwan Operations)` 或 `Scope 1+2 (Company only)`，一律刪除括號內容，只保留 `Scope 1+2`)。
+
+### 2. 📦 Focus Area: Packaging (包裝與循環經濟)
+   - **Target Metrics**: 
+     - `Recycled Content` (再生料使用比例, e.g., rPET)
+     - `Virgin Plastic Reduction` (原生塑膠減量)
+     - `Packaging Design` (可回收/可堆肥設計, e.g., Recyclability)
+     - `Reuse Models` (重複使用模式/減量)
+     - `Waste to Landfill` (廢棄物掩埋率)
+   - **Typical Scopes**: `Plastic Packaging`, `Beverage Containers`, `Food Packaging`, `Global Portfolio`
+
+### 3. 💧 Focus Area: Water (水資源)
+   - **Target Metrics**: 
+     - `Water Replenishment` (水資源回補)
+     - `Water Use Efficiency` (用水效率/強度)
+   - **Typical Scopes**: `High Water-Risk Areas`, `Manufacturing Operations`
+
+### 4. 🌱 Focus Area: Agriculture (永續農業)
+   - **Target Metrics**: 
+     - `Regenerative Agriculture` (再生農業採用面積)
+     - `Sustainably Sourced` (永續採購比例)
+   - **Typical Scopes**: `Key Ingredients`, `Direct Supply Chain`
+
+### 5. 👥 Focus Area: Human Rights & Social (人權與社會)
+   - **Target Metrics**: 
+     - `Gender Diversity` (性別多樣性/管理層比例)
+     - `Safety` (工傷率/安全事故)
+     - `Human Rights Audit` (人權盡職調查)
+   - **Typical Scopes**: `Global Workforce`, `Management Roles`, `Tier 1 Suppliers`
+# Task 2: Data Cleaning Rules (資料清洗規則)
+1. **歷史進度與趨勢數據抽取 (Progress_History)**:
+   - 當圖表或表格中出現「年度 + 數值」的趨勢線或長條圖 (例如 2005~2030 年排放量趨勢)，請**盡可能抽取所有可以辨識的年度與對應數值**。
+   - 這些年度與數值請一律填入 `Progress_History` 欄位。
+   - 即使這些年份小於或等於 {current_year}，也**不要忽略**，因為後續風險計算需要完整的歷史趨勢。
+2. **Deadline Logic**:
+   - 優先檢查目標描述內的年份 (如 "by 2025")。
+   - 若無，則使用表頭年份 (如 "2030 Target")。
+3. **Value Parsing**: 只提取目標數值 (如 "100%", "50%", "2,467 萬噸")，去除無關敘述，但可保留必要單位。
+4. **Baseline Logic (基準年判定策略)**:
+   - **直接描述**: 優先檢查目標文字中是否包含 "vs. 20XX baseline" 或 "from a 20XX base"。
+   - **註腳關聯 (Footnote & Superscript)**: 檢查目標文字或**該區塊標題**旁邊是否有上標數字 (如 `[1]`, `1`)。若有，請務必檢索表格底部或頁尾的註腳文字 (Footnotes/Comments)，通常基準年會定義在那裡 (例如 "Measured versus a 2020 baseline")。
+   - **層級繼承 (Hierarchy Inheritance)**: 若該指標 (e.g., Recycled Content) 屬於一個大目標 (Parent Goal, e.g., Virgin Plastic Reduction) 的子項，且大目標或區塊標題有明確基準年，請**繼承**該基準年。
+   - **最後手段**: 若以上皆無，才考慮使用 Progress_History 中最早那年 - 1。
+
+# Output JSON Schema
+請輸出一個 JSON List：
+[
+  {{
+    "Report_Year": {current_year},
+"Standardized_Focus_Area": "String (e.g., 'Packaging', 'Climate')",
+    "Standardized_Metric": "String (e.g., 'Recycled Content')",
+    
+    // Level 3: 適用範疇/材質
+    // 規則：
+    // 1. 優先從註腳或標題提取主要範疇 (如 "Primary plastic packaging")。
+    // 2. 若 Original_Goal_Text 中明確提及衡量方式 (如 "absolute tonnage", "per serving")，請務必補充在括號內。
+    // 範例輸入: "Reduce absolute tonnage... of primary plastic" -> 輸出: "Primary plastic packaging (absolute tonnage)"
+    "Scope": "String",
+    
+    "Original_Goal_Text": "String (保留報告中的完整原始描述)",
+    "Target_Deadline": Number (e.g., 2025, 2030),
+    "Target_Value": "String (e.g., '25%', '50%', 'Net Zero')",
+    
+    // Baseline 提取注意：請務必檢查上標(superscript)對應的註腳，或大標題的基準年設定
+    "Baseline_Year": "String (若有提及基準年則填入，否則 null)",
+    "Progress_History": [
+       {{ "Year": Number, "Value": "String" }}
+    ]
+  }}
+]
+
+# Begin Extraction
+請分析以下內容：
+{content}
+"""
+    return template
+
+
+
+
+----------- .\core\risk.py -----------
+
+import ast
+from collections import defaultdict
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
+
+import pandas as pd
+
+from .cleaning import clean_value, clean_year
+
+
+def calculate_risk(
+    json_data: List[Dict[str, Any]],
+) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    """
+    核心風險計算函式
+    支援: 線性預期法、距離目標法、絕對值動態轉百分比
+
+    參數:
+        json_data: 由 LLM 輸出的目標資料列表
+
+    回傳:
+        (分析結果 DataFrame, 警告列表)
+    """
+    results: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []  # 追蹤需要顯示警告的記錄
+
+    # --- 預處理：為每筆資料判斷是否與同組的前一筆 target 不同 ---
+    change_notes_by_index: Dict[int, str] = {}
+    entries: List[Dict[str, Any]] = []
+    for idx, it in enumerate(json_data):
+        f = it.get("Standardized_Focus_Area", "Unknown")
+        m = it.get("Standardized_Metric", "Unknown")
+        s = it.get("Scope", "Global")
+        norm_s = (
+            it.get("Normalize_Scope")
+            or it.get("Normalized_Scope")
+            or it.get("NormalizedScope")
+            or it.get("Standardized_Scope")
+            or s
+        )
+        ry = clean_year(it.get("Report_Year"))
+        ty = clean_year(it.get("Target_Deadline"))
+        tv = it.get("Target_Value")
+        by = clean_year(it.get("Baseline_Year"))
+        entries.append(
+            {
+                "idx": idx,
+                "focus": f,
+                "metric": m,
+                "norm_scope": norm_s,
+                "report_year": ry,
+                "target_year": ty,
+                "target_val": tv,
+                "baseline_year": by,
+            }
+        )
+
+    groups: Dict[Any, List[Dict[str, Any]]] = defaultdict(list)
+    for e in entries:
+        groups[(e["focus"], e["metric"], e["norm_scope"])].append(e)
+
+    for _, lst in groups.items():
+        # 先按 Report_Year 升序排列，缺年者放到最後（維持原始順序）
+        lst_with_year = [e for e in lst if e["report_year"] is not None]
+        lst_no_year = [e for e in lst if e["report_year"] is None]
+        lst_sorted = sorted(lst_with_year, key=lambda x: x["report_year"]) + lst_no_year
+        for i in range(1, len(lst_sorted)):
+            prev = lst_sorted[i - 1]
+            cur = lst_sorted[i]
+            prev_ty = prev.get("target_year")
+            prev_tv = prev.get("target_val")
+            cur_ty = cur.get("target_year")
+            cur_tv = cur.get("target_val")
+            prev_by = prev.get("baseline_year")
+            cur_by = cur.get("baseline_year")
+            # 先比較 target（deadline 或 value），若 target 相同再比較 baseline year
+            if (prev_ty != cur_ty) or (prev_tv != cur_tv):
+                change_notes_by_index[
+                    cur["idx"]
+                ] = f"; 目標已變更 (前: {prev_ty}年 {prev_tv} -> 現: {cur_ty}年 {cur_tv})"
+                if prev_by != cur_by:
+                    change_notes_by_index[cur["idx"]] += (
+                        f"; 基準年已變更 (前: {prev_by} -> 現: {cur_by})"
+                    )
+            elif prev_by != cur_by:
+                change_notes_by_index[
+                    cur["idx"]
+                ] = f"基準年已變更 (前: {prev_by} -> 現: {cur_by})"
+
+    # --- 主要計算流程 ---
+    for idx, item in enumerate(json_data):
+        try:
+            # --- A. 基礎資料讀取 ---
+            focus_area = item.get("Standardized_Focus_Area", "Unknown")
+            metric = item.get("Standardized_Metric", "Unknown")
+            scope = item.get("Scope", "Global")
+            report_year = clean_year(item.get("Report_Year"))
+
+            # 讀取目標 (Target)
+            target_year = clean_year(item.get("Target_Deadline"))
+            target_val_str = item.get("Target_Value")
+            # 優先嘗試可能的標準化 scope 欄位
+            norm_scope = (
+                item.get("Normalize_Scope")
+                or item.get("Normalized_Scope")
+                or item.get("NormalizedScope")
+                or item.get("Standardized_Scope")
+                or scope
+            )
+            _ = norm_scope  # 保留變數以利日後擴充
+
+            # 從預處理結果中取得變更備註（若有）
+            change_note = change_notes_by_index.get(idx, "")
+
+            # 讀取基準年 (Baseline)
+            base_year = clean_year(item.get("Baseline_Year"))
+
+            # 目標通常是百分比，強制視為百分比處理
+            target_reduction, _, _ = clean_value(target_val_str)
+
+            # 如果目標沒寫%，但數值比如是 20，通常指 20% (0.2)
+            if target_reduction is not None and target_reduction > 1:
+                target_reduction /= 100
+
+            # --- B. 解析進度歷史 (Progress History) ---
+            history_str = item.get("Progress_History", "[]")
+            try:
+                if isinstance(history_str, list):
+                    history_list = history_str
+                else:
+                    history_list = ast.literal_eval(history_str)
+            except Exception:
+                history_list = []
+
+            if not history_list:
+                results.append(
+                    {
+                        "Focus_Area": focus_area,
+                        "Metric": metric,
+                        "Report_Year": report_year,
+                        "Risk_Level": "數據不足",
+                        "Analysis_Note": "無歷史進度數據",
+                        "Target": f"{target_year}年 {target_val_str}",
+                        "Has_Negative_Warning": False,
+                        "Target_Change_Note": change_note,
+                    }
+                )
+                continue
+
+            # 整理歷史數據
+            history_map: Dict[int, Dict[str, Any]] = {}
+            valid_history: List[Dict[str, Any]] = []
+            has_negative_warning = False  # 追蹤是否有負數警告
+
+            for h in history_list:
+                y = clean_year(h.get("Year"))
+                raw_v = h.get("Value")
+                v, is_pct, is_negative_fmt = clean_value(raw_v)
+
+                if y is not None and v is not None:
+                    record = {
+                        "Year": y,
+                        "Value": v,
+                        "Is_Pct": is_pct,
+                        "Raw": raw_v,
+                        "Is_Negative_Fmt": is_negative_fmt,
+                    }
+                    valid_history.append(record)
+                    history_map[y] = record
+                    # 如果最新年份有負數格式警告
+                    if is_negative_fmt:
+                        has_negative_warning = True
+
+            if not valid_history:
+                results.append(
+                    {
+                        "Focus_Area": focus_area,
+                        "Metric": metric,
+                        "Report_Year": report_year,
+                        "Scope": scope,
+                        "Risk_Level": "數據不足",
+                        "Note": "無歷史進度數據",
+                        "Target": f"{target_year}年 {target_val_str}",
+                        "Current_Status": "N/A",
+                        "Has_Negative_Warning": False,
+                        "Target_Change_Note": change_note,
+                        "Analysis_Note": "",
+                    }
+                )
+                continue
+
+            valid_history.sort(key=lambda x: x["Year"])
+            latest_record = valid_history[-1]
+            Y_current = latest_record["Year"]
+
+            # 如果缺少基準年，但有歷史數據，顯示該年度的減量狀況
+            if base_year is None:
+                actual_reduction = latest_record["Value"]
+                results.append(
+                    {
+                        "Focus_Area": focus_area,
+                        "Metric": metric,
+                        "Report_Year": report_year,
+                        "Scope": scope,
+                        "Risk_Level": "數據不足",
+                        "Target": f"{target_year}年 {target_val_str}",
+                        "Current_Status": f"{Y_current}年 (減量 {actual_reduction:.1%})"
+                        if actual_reduction is not None
+                        else "N/A",
+                        "Has_Negative_Warning": False,
+                        "Target_Change_Note": change_note,
+                        "Analysis_Note": "無法計算風險（缺少基準年）",
+                    }
+                )
+                continue
+
+            # --- C. 計算實際減量 (Actual Reduction) ---
+            actual_reduction = 0.0
+            calc_method = ""
+
+            # 判斷是用「絕對值」算還是直接拿「百分比」
+            if not latest_record["Is_Pct"]:
+                # 情境 1: 歷史數據是「絕對數值」(Absolute Value)
+                if base_year in history_map:
+                    base_val = history_map[base_year]["Value"]
+                    curr_val = latest_record["Value"]
+
+                    if base_val != 0:
+                        # 公式: (基準 - 現在) / 基準
+                        actual_reduction = (base_val - curr_val) / base_val
+                        calc_method = (
+                            f"絕對值計算 (基準{base_year}: {base_val:,.0f} "
+                            f"-> {Y_current}: {curr_val:,.0f})"
+                        )
+                    else:
+                        results.append(
+                            {
+                                "Focus_Area": focus_area,
+                                "Metric": metric,
+                                "Report_Year": report_year,
+                                "Risk_Level": "數據錯誤",
+                                "Analysis_Note": "基準年排放量為 0",
+                                "Has_Negative_Warning": False,
+                                "Target_Change_Note": change_note,
+                            }
+                        )
+                        continue
+                else:
+                    results.append(
+                        {
+                            "Focus_Area": focus_area,
+                            "Metric": metric,
+                            "Report_Year": report_year,
+                            "Risk_Level": "數據不足",
+                            "Target": f"{target_year}年 {target_val_str}",
+                            "Analysis_Note": (
+                                "歷史數據為絕對值，但在 History 中找不到基準年 "
+                                f"({base_year}) 的數據。"
+                            ),
+                            "Has_Negative_Warning": False,
+                            "Target_Change_Note": change_note,
+                        }
+                    )
+                    continue
+            else:
+                # 情境 2: 歷史數據本身就是「減量百分比」
+                actual_reduction = latest_record["Value"]
+                calc_method = "直接讀取百分比"
+
+            # --- D. 核心演算法 (Risk Logic) ---
+            total_years = target_year - base_year
+            elapsed_years = Y_current - base_year
+
+            if total_years <= 0:
+                results.append(
+                    {
+                        "Focus_Area": focus_area,
+                        "Metric": metric,
+                        "Report_Year": report_year,
+                        "Risk_Level": "設定錯誤",
+                        "Analysis_Note": "目標年早於基準年",
+                        "Has_Negative_Warning": False,
+                        "Target_Change_Note": change_note,
+                    }
+                )
+                continue
+
+            elapsed_years = max(0, elapsed_years)
+
+            # 方法一：線性預期進度法
+            expected_progress = (elapsed_years / total_years) * target_reduction
+
+            if expected_progress and expected_progress > 0:
+                gap = (expected_progress - actual_reduction) / expected_progress
+            else:
+                gap = 0
+
+            flag1 = gap > 0.1  # 落後 10% 以上
+            flag3 = gap > 1.0  # 落後 100% 以上
+
+            # 方法二：距離目標法
+            time_ratio = elapsed_years / total_years if total_years else 0
+            target_ratio = (
+                actual_reduction / target_reduction if target_reduction and target_reduction > 0 else 0
+            )
+
+            flag2 = time_ratio >= 0.5 and target_ratio < 0.5
+
+            # --- E. 風險判定 ---
+            if (flag1 and flag2) or flag3:
+                risk_level = "🔴 高度風險"
+            elif flag1 or flag2:
+                risk_level = "🟠 中度風險"
+            else:
+                risk_level = "🟢 低風險"
+
+            # --- F. 產生備註 ---
+            if risk_level.startswith("🟢"):
+                note = f"進度符合預期。{calc_method}"
+            else:
+                note = (
+                    f"應減 {expected_progress:.1%}, 實減 {actual_reduction:.1%} "
+                    f"(Gap: {gap:.1%})。 {calc_method}"
+                )
+
+            result_item = {
+                "Focus_Area": focus_area,
+                "Report_Year": report_year,
+                "Metric": metric,
+                "Scope": scope,
+                "Target": f"{target_year}年 {target_val_str}",
+                "Current_Status": f"{Y_current}年 (減量 {actual_reduction:.1%})",
+                "Risk_Level": risk_level,
+                "Analysis_Note": note,
+                "Has_Negative_Warning": has_negative_warning and actual_reduction < 0,
+                "Target_Change_Note": change_note,
+            }
+            results.append(result_item)
+
+            # 如果有負數警告，添加到警告列表
+            if result_item["Has_Negative_Warning"]:
+                warnings.append(
+                    {
+                        "Focus_Area": focus_area,
+                        "Metric": metric,
+                        "Year": Y_current,
+                        "Status": actual_reduction,
+                    }
+                )
+
+        except Exception as e:  # noqa: BLE001
+            results.append(
+                {
+                    "Focus_Area": item.get("Standardized_Focus_Area"),
+                    "Metric": item.get("Standardized_Metric"),
+                    "Report_Year": item.get("Report_Year"),
+                    "Risk_Level": "計算錯誤",
+                    "Note": str(e),
+                    "Current_Status": "N/A",
+                    "Target": "N/A",
+                    "Analysis_Note": "N/A",
+                    "Scope": "N/A",
+                    "Has_Negative_Warning": False,
+                }
+            )
+
+    return pd.DataFrame(results), warnings
+
+
+
+
+----------- .\memory-bank\architecture.md -----------
+
+### 專案架構總覽
+
+本工具的目標是將 ESG 報告從 **PDF → Markdown → LLM JSON → 風險計算結果** 串成一條乾淨、可維護的資料流；
+同時也提供一條 **PDF → LLM JSON (Vision) → 風險計算結果** 的 CLI 流程，用來直接從圖表頁擷取目標與歷史趨勢數據。
+
+- **UI Layer (`ui/` + `app.py`)**  
+  - 負責所有 Streamlit 互動、檔案上傳、按鈕與頁籤切換。
+  - 不寫商業邏輯，只呼叫 core 模組。
+- **Core Layer (`core/`)**  
+  - 放所有與 ESG/數據處理相關的「純邏輯」：清洗、風險計算、Prompt 生成、PDF 混合內容抽取與 Gemini 串接。
+  - 這層理論上可以被 CLI、API、Batch Job 重複使用。
+
+---
+
+### 檔案與模組職責
+
+- **`app.py`**  
+  - Streamlit 的入口檔（`streamlit run app.py`）。  
+  - 建立 3 個頁籤，分別委派到 `ui/tab_pdf_to_md.py`、`ui/tab_generate_prompt.py`、`ui/tab_risk_assessment.py` 來渲染內容。  
+  - 理想情況：這裡不再出現任何清洗邏輯或複雜演算法，只做「版面配置 + 呼叫模組」。目前仍保留舊版實作，可逐步收斂成僅呼叫 UI 模組。
+
+#### Core Layer
+
+- **`core/cleaning.py`**
+  - `clean_year(value)`：將任意輸入（字串、float、None）轉為年份 `int`，失敗回 `None`。
+  - `clean_value(value)`：通用數值 parser。  
+    - 支援會計負數 `(5)` → `-5`。  
+    - 避免抓到單位中的數字（例如 `tCO2` 的 `2`）。  
+    - 自動辨識百分比並轉為 0–1 間小數。  
+  - `normalize_packaging_scope(scope)`：將與包裝/塑膠相關的描述（virgin / recycled / reusable...）對應到標準化 Scope tag。
+  - 此模組不依賴 Streamlit，可單獨用於 batch 處理或測試。
+
+- **`core/risk.py`**
+  - `calculate_risk(json_data)`：整個 ESG 目標的風險計算核心。  
+  - 輸入：LLM 依照 Prompt schema 產出的 JSON list。  
+  - 主要步驟：  
+    1. 依 `Standardized_Focus_Area + Standardized_Metric + Scope` 分組，同組內比對目標與基準年的變更，產出 `Target_Change_Note`。  
+    2. 對每筆目標解析 `Progress_History`，用 `clean_year`/`clean_value` 清洗。  
+    3. 如果歷史是「絕對值」，依 `baseline` → `current` 計算減量百分比；若本身是百分比則直接使用。  
+    4. 用 **線性預期進度法** + **距離目標法** 兩種方法算落後程度，輸出 `Risk_Level`（🔴/🟠/🟢）與說明文字。  
+    5. 若發現會計負數且實際減量 < 0，標記為 `Has_Negative_Warning`，並在 UI 層彈出警告。  
+  - 回傳：`(pandas.DataFrame, warnings_list)`。DataFrame 給 UI 顯示/下載，warnings 給 UI 顯示紅色 alert。
+
+- **`core/pdf_extractor.py` + `pp.py`**
+  - `pp.extract_content_smart(pdf_path, page_num)`：單頁智慧抽取器。  
+    - 先用 PyMuPDF 讀取頁面文字；若文字長度 `< 1000`，視為「掃描/大圖頁」，直接把整頁渲染成高解析 PNG，並在回傳文字中標註為掃描提示。  
+    - 若文字足夠，當作一般文字頁：保留 `page.get_text()` 的全文，同時抓取頁面中所有內嵌圖片 bytes。  
+  - `core.pdf_extractor.extract_mixed_content(pdf_path)`：多頁混合內容提取器。  
+    - 逐頁呼叫 `extract_content_smart`，組成一個 list，每頁包含：`page_index`, `text`, `images`, `is_scanned`。  
+    - 為了確保 LLM 真的「看到」所有向量圖表，對於 **非掃描頁 (`is_scanned=False`)**，額外再補一張整頁 screenshot（中等解析度 PNG）放進 `images`。  
+    - 最終保證：每一頁送進 Vision 的 `images` 中都至少有一張「完整頁面」的截圖，避免圖表被 PDF 向量格式吃掉。
+
+- **`core/gemini_client.py`**
+  - `GeminiClient`：封裝 Google Gemini 1.5/2.x Flash/Lite 模型（透過 `google-generativeai`）。  
+    - 在 `__init__` 內使用 `python-dotenv` 載入 `.env`，從 `GOOGLE_API_KEY` 取得金鑰並呼叫 `genai.configure()`。  
+    - `_describe_images(images)`：使用 Vision 模型先把圖表/趨勢圖轉成結構化描述文字（特別強調「年度 + 數值」與 baseline/減量百分比），輸出會長得像：  
+      - `2005: 2,567 萬噸`, `2006: 2,710 萬噸`, `比 2007 年 3,182 萬噸減少 22%` … 等。  
+    - `extract_goals_from_page(page_text, images, current_year)`：  
+      1. 先呼叫 `_describe_images`，取得所有圖片中的目標值 + 歷史趨勢文字。  
+      2. 將「原始頁面文字」與「Vision 產生的圖表描述」合併為一段 `content`，丟給 `core.prompt.get_audit_prompt` 產生長 Prompt。  
+      3. 呼叫 Gemini，設定 `response_mime_type="application/json"`，強制產生符合 Schema 的 JSON list。  
+      4. 對回傳結果做 `json.loads` 與容錯處理（單物件/包在 `items`、`data` 等 key 下都能處理），最後回傳 `List[Dict]`。
+
+- **`core/prompt.py`**
+  - `get_audit_prompt(current_year, content)`：產生給 LLM（ChatGPT/Claude/Gemini 等）的長 prompt。  
+  - 內容包含：  
+    - Role & Context（稽核員角色 + 報告年份）。  
+    - 標準化 ESG 字典（Focus Area / Metric / Scope）。  
+    - 資料清洗規則（**強制抽取歷史趨勢至 `Progress_History`**，以及 deadline/baseline 推論邏輯）：  
+      - 專門一條規則描述：當圖表或表格中出現「年度 + 數值」的趨勢線或長條圖（例如 2005~2030 年排放量趨勢），LLM 必須盡可能把所有可辨識的年度與數值抽出來，填入 `Progress_History`（即使年份早於當前年份也不能忽略）。  
+      - 其他規則則負責從原文判斷 Target 年份、Baseline 年份與 Target 值（例如「比 2007 年減少 22%」）。  
+    - 最終輸出 JSON Schema。  
+    - 並把實際的 Markdown 內容 (`content`) 夾在最後給 LLM 解析。
+  - 這個函式是「單純 string 模板」，不依賴 Streamlit。
+
+#### UI Layer
+
+- **`ui/tab_pdf_to_md.py`**
+  - Tab1：「報告轉換 (PDF → Markdown)」。  
+  - 流程：  
+    1. 使用 `st.file_uploader` 上傳 PDF。  
+    2. 由檔名猜測預設年份（`20xx` regex）。  
+    3. 使用 `MarkItDown` 將 PDF 轉成 Markdown 文字。  
+    4. 結果寫入 `st.session_state.markdown_content` 與 `st.session_state.report_year`。  
+    5. 提供 Markdown 預覽與 `.md` 下載。  
+  - 此 tab 僅負責 **I/O 與狀態紀錄**，不處理後續 LLM 或風險計算。
+
+- **`ui/tab_generate_prompt.py`**
+  - Tab2：「產生稽核 Prompt」。  
+  - 從 `st.session_state.markdown_content` & `report_year` 讀取資料，呼叫 `core.prompt.get_audit_prompt`。  
+  - 顯示完整 Prompt 供複製，並提供 `.txt` 下載。  
+  - 若尚未完成 Tab1 轉換，會顯示提示訊息。
+
+- **`ui/tab_risk_assessment.py`**
+  - Tab3：「績效追蹤與風險評估」。  
+  - 流程：  
+    1. 上傳 LLM 輸出的 JSON 檔（格式需符合 Prompt 定義）。  
+    2. 呼叫 `core.risk.calculate_risk` 拿到 DataFrame 與警告列表。  
+    3. 針對 `Has_Negative_Warning` 的紀錄以 `st.error` 顯示紅色警告。  
+    4. 將結果以 `st.dataframe` 呈現，並輸出成 CSV 下載。  
+  - UI 部分仍維持原本的排序、欄位隱藏邏輯，只是商業邏輯被搬到 core。
+
+---
+
+### 資料流 (Data Flow)
+
+1. **PDF → Markdown（互動式 UI 流程）**
+   - 使用者在 Tab1 上傳 PDF。  
+   - `ui/tab_pdf_to_md.py` 呼叫 `MarkItDown` 抽取文字，寫入 `st.session_state.markdown_content`。  
+   - 同時記錄 `report_year`。
+
+2. **Markdown → LLM Prompt**
+   - Tab2 讀取 `markdown_content` + `report_year`。  
+   - 呼叫 `core.prompt.get_audit_prompt()` 產出長 prompt。  
+   - 使用者將此 prompt 貼給 LLM，取得 JSON 檔案。
+
+3. **LLM JSON → 風險分析**
+   - 使用者在 Tab3 上傳 JSON。  
+   - `ui/tab_risk_assessment.py` 呼叫 `core.risk.calculate_risk(json_data)`。  
+   - 風險結果（包含 Gap、預期進度、實際進度與 Target_Change_Note）以表格與 CSV 形式呈現。
+
+4. **PDF → LLM JSON（Vision + CLI 流程）**
+   - 使用者在命令列執行：  
+     - `python esg_goal_miner.py --pdf <報告PDF> --year <報告年份> --output <輸出JSON路徑>`。  
+   - `esg_goal_miner.py`：  
+     1. 呼叫 `core.pdf_extractor.extract_mixed_content`，逐頁取得 `{ page_index, text, images, is_scanned }`。  
+     2. 對每一頁呼叫 `GeminiClient.extract_goals_from_page`，將文字 + 圖片（包含整頁 screenshot）送進 Gemini Vision + Text 模型。  
+     3. 收集所有頁面的 JSON 結果，統一寫成一個 `.json` 檔（每筆至少包含 `Report_Year`, `Standardized_Focus_Area`, `Standardized_Metric`, `Scope`, `Original_Goal_Text`, `Target_Deadline`, `Target_Value`, `Baseline_Year`, `Progress_History`）。  
+   - 後續若要做風險分析，可直接將此 JSON 檔丟進 UI Tab3 或在 Notebook 中呼叫 `core.risk.calculate_risk`。
+
+---
+
+### 效能與維護性優化說明
+
+- 將清洗與計算邏輯集中到 `core/`，避免在 UI 中重複撰寫邏輯，之後若要改演算法只需改一處。  
+- `calculate_risk` 先做一次分組與 target/baseline 變更偵測，再進入主計算迴圈，減少重複運算與判斷。  
+- Streamlit 層專注在狀態（`st.session_state`）與 I/O，未來若要改成 API 服務，只需重用 core 模組即可。  
+- UI 模組彼此獨立，新增第 4 個 tab（例如圖表視覺化）時，只需要新建一個 `ui/tab_xxx.py` 並在 `app.py` 新增一個 tab 呼叫。
+
+
+
+
+----------- .\memory-bank\progress.md -----------
+
+### 檔案進度與設計理由總覽
+
+此文件紀錄目前每個檔案「在幹嘛」以及「為什麼要這樣設計」，方便未來自己或其他開發者接手。
+
+---
+
+### 1. `app.py`
+
+- **目前狀態**
+  - 原始版本：同時包含所有清洗邏輯、風險計算、Prompt 模板與三個 Streamlit 分頁 UI。  
+  - 設計目標：逐步收斂為「只做頁籤配置與呼叫 UI 模組」的薄入口。
+
+- **下一步建議重構**
+  - 已新增 `core/` 與 `ui/` 模組，建議你接下來將：  
+    - 風險計算相關的 `calculate_risk` 全數移到 `core/risk.py`（目前已存在強化版，可改為從該模組匯入）。  
+    - 數值與年份清洗 `clean_year`、`clean_value`、`normalize_packaging_scope` 改用 `core/cleaning.py`。  
+    - Tab1/2/3 的 UI 內容，改為呼叫 `ui/tab_*.py` 中的 `render()` 函式，讓 `app.py` 只保留：  
+      ```python
+      tab1, tab2, tab3 = st.tabs([...])
+      with tab1: tab_pdf_to_md.render()
+      ```
+
+- **設計理由**
+  - 保留舊實作可以降低一次性大改的風險，你可以在本地逐步測試、確認新 core / ui 模組穩定後，再讓 `app.py` 完全切換到新架構。
+
+---
+
+### 2. `core/cleaning.py`
+
+- **在幹嘛**
+  - 集中所有「通用前處理」：  
+    - `clean_year` 統一處理各種年份格式。  
+    - `clean_value` 統一處理數值、百分比、會計負數、避免單位黏數字。  
+    - `normalize_packaging_scope` 整理包裝相關 scope tag。
+
+- **為什麼這樣設計**
+  - 這些函式與 UI 完全無關，只跟資料有關，適合獨立在 core 層，方便：  
+    - 單元測試。  
+    - 其他服務（如批次腳本、API）重用。
+
+---
+
+### 3. `core/risk.py`
+
+- **在幹嘛**
+  - `calculate_risk(json_data)`：統一管理所有 ESG 目標風險計算邏輯。  
+  - 將舊版 `app.py` 中的核心演算法抽出並加上型別註記與錯誤處理，使其更穩定、可重複使用。
+
+- **為什麼這樣設計**
+  - 風險演算法是業務核心，不應該散落在 UI 程式碼裡。  
+  - 分離後：  
+    - 可以很容易在 Jupyter Notebook、CLI 或後端服務中重用同一個 `calculate_risk`。  
+    - 未來若要改演算法（例如加上新的 flag 或 scoring），只需改這一支。
+
+---
+
+### 4. `core/prompt.py`
+
+- **在幹嘛**
+  - `get_audit_prompt(current_year, content)`：封裝 LLM Prompt 模板的產生邏輯。
+  - 把舊 `app.py` 裡長長的 f-string 抽出來，變成乾淨的一個函式。
+
+- **為什麼這樣設計**
+  - Prompt 本質上是「文字模板」，和 UI 或資料計算邏輯不同。  
+  - 抽到 core 之後：  
+    - 可以在 CLI 或其他介面直接呼叫 `get_audit_prompt`，不用依賴 Streamlit。  
+    - 未來若要針對不同客戶／標準（如 SBTi / TCFD）調整 Prompt，可以增加多個函式或參數，而不污染 UI 程式碼。
+
+---
+
+### 5. `ui/tab_pdf_to_md.py`
+
+- **在幹嘛**
+  - 負責 Tab1：「報告轉換 (PDF → Markdown)」的所有畫面與流程。  
+  - 只處理：檔案上傳、年份輸入、呼叫 `MarkItDown` 轉檔、寫入 `st.session_state`、顯示預覽與提供下載。
+
+- **為什麼這樣設計**
+  - 讓「一個檔案對應一個頁籤」，降低耦合。  
+  - 若未來要增加更多轉檔方式（例如支援 DOCX、HTML），只改這一支，不影響風險計算與 Prompt。
+
+---
+
+### 6. `ui/tab_generate_prompt.py`
+
+- **在幹嘛**
+  - 負責 Tab2：「產生稽核 Prompt」的畫面。  
+  - 從 `session_state` 取 Markdown + 年份，呼叫 `core.prompt.get_audit_prompt`，顯示與下載。
+
+- **為什麼這樣設計**
+  - UI 層只專注在展示與下載，真正的 Prompt 結構留在 core。  
+  - 若未來要多一種 Prompt（例如「回溯歷史驗證用」），可以在這裡多一個選項 + 調用不同的 core 函式。
+
+---
+
+### 7. `ui/tab_risk_assessment.py`
+
+- **在幹嘛**
+  - 負責 Tab3：「績效追蹤與風險評估」。  
+  - 上傳 JSON → 呼叫 `core.risk.calculate_risk` → 顯示 DataFrame + 下載 CSV → 對負向進度顯示紅色警示。
+
+- **為什麼這樣設計**
+  - 演算法與 UI 明確分離：  
+    - 當你想改 UI（例如加上篩選、多語言切換）時，不會誤動到風險演算法。  
+    - 當你想改演算法，也不用動到任何 Streamlit 元件。
+
+---
+
+### 後續建議（Roadmap）
+
+- **短期**
+  - 將 `app.py` 逐步改寫為只匯入 `ui/` 模組並呼叫 `render()`。  
+  - 刪除 `app.py` 裡已被抽出到 `core/` 的函式，避免重複邏輯。  
+
+- **中期**
+  - 為 `core/cleaning.py` 與 `core/risk.py` 增加簡單的單元測試，確保未來改動不會破壞演算法。  
+  - 把共用常數（例如 emoji、文字標籤）集中到一個 `constants.py`。  
+
+- **長期**
+  - 將 core 封裝成可被其他專案 import 的小型 package，Streamlit 僅是其中一個前端介面。  
+  - 若有需要，可以新增一個 `api/` 層（FastAPI / Flask）讓外部系統能呼叫同一套風險計算邏輯。
+
+
+
+
+----------- .\ui\__init__.py -----------
+
+"""
+Streamlit UI 分頁模組包：
+- tab_pdf_to_md: PDF -> Markdown 轉換流程
+- tab_generate_prompt: Prompt 產生流程
+- tab_risk_assessment: JSON -> 風險分析流程
+"""
+
+
+
+
+----------- .\ui\tab_generate_prompt.py -----------
+
+import streamlit as st
+
+from core.prompt import get_audit_prompt
+
+
+def render() -> None:
+    """Tab 2: 產生稽核 Prompt"""
+    st.header("步驟二：生成 AI 稽核 Prompt")
+    st.markdown("將轉換後的內容結合標準化指令，產生可供 ChatGPT/Claude/Gemini 使用的 Prompt。")
+
+    if st.session_state.get("markdown_content"):
+        final_prompt = get_audit_prompt(
+            st.session_state.get("report_year", 2024),
+            st.session_state["markdown_content"],
+        )
+
+        st.info(
+            "💡 請複製下方內容，貼給 LLM 模型，並將其回傳的 JSON 存檔供步驟三使用。"
+        )
+        st.text_area("Prompt 預覽", final_prompt, height=400, key="prompt_preview")
+
+        st.download_button(
+            label="下載完整 Prompt (.txt)",
+            data=final_prompt,
+            file_name=f"Audit_Prompt_{st.session_state.get('report_year', 2024)}.txt",
+            mime="text/plain",
+        )
+    else:
+        st.warning("請先在步驟一上傳並轉換 PDF 報告。")
+
+
+
+
+----------- .\ui\tab_pdf_to_json.py -----------
+
+import json
+import re
+import tempfile
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+import streamlit as st
+
+from core.gemini_client import GeminiClient
+from core.pdf_extractor import extract_mixed_content
+
+
+def _infer_year_from_name(name: str, default: int = 2024) -> int:
+    match = re.search(r"20\d{2}", name)
+    if match:
+        try:
+            return int(match.group(0))
+        except ValueError:
+            return default
+    return default
+
+
+def _run_extraction(
+    pdf_path: Path, report_year: int, pages_filter: Optional[Set[int]] = None
+) -> List[Dict[str, Any]]:
+    """直接在記憶體中執行 PDF → JSON 目標擷取，不寫入實體 JSON 檔。
+
+    pages_filter:
+        若提供，僅對指定頁碼呼叫 Gemini（0-based page index）。
+        例如 {0, 4, 5} 代表第 1, 5, 6 頁。
+    """
+    pages = extract_mixed_content(str(pdf_path))
+
+    if pages_filter:
+        pages = [p for p in pages if int(p.get("page_index", -1)) in pages_filter]
+    client = GeminiClient()
+
+    all_items: List[Dict[str, Any]] = []
+    for page in pages:
+        text: str = page["text"]
+        images: List[bytes] = page["images"]
+
+        page_items = client.extract_goals_from_page(
+            page_text=text,
+            images=images,
+            current_year=report_year,
+        )
+
+        for item in page_items:
+            if isinstance(item, dict):
+                item.setdefault("Report_Year", report_year)
+                all_items.append(item)
+
+    return all_items
+
+
+def render() -> None:
+    """單一頁籤：上傳 PDF → 直接產出目標 JSON。"""
+    st.header("步驟一：上傳 ESG 報告並自動擷取目標 (PDF → JSON)")
+    st.markdown(
+        """
+        上傳 ESG 報告 PDF 後，系統將：
+        1. 逐頁讀取文字與圖表（含整頁截圖給 Vision 模型）
+        2. 依照標準化字典與 Schema，自動擷取「承諾目標」並輸出 JSON
+        """
+    )
+
+    uploaded_pdf = st.file_uploader(
+        "上傳 ESG 報告書 (PDF)", type=["pdf"], key="pdf_uploader_v2"
+    )
+
+    # 推測預設年份
+    default_year = 2024
+    if uploaded_pdf:
+        default_year = _infer_year_from_name(uploaded_pdf.name, default_year)
+
+    report_year = st.number_input(
+        "設定報告年份",
+        min_value=2000,
+        max_value=2050,
+        value=default_year,
+        key="report_year_input_v2",
+    )
+
+    if "goal_json" not in st.session_state:
+        st.session_state.goal_json = None
+
+    # 可選：限制要解析的頁碼，降低 API 成本
+    pages_raw = st.text_input(
+        "（選填）只解析特定頁碼以節省 API 成本，例如：5 或 3-7,10（以 1 為起始頁）",
+        value="",
+        key="pages_filter_v2",
+    )
+
+    pages_filter: Optional[Set[int]] = None
+    if pages_raw.strip():
+        pages_filter = set()
+        for part in pages_raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    start_s, end_s = part.split("-", 1)
+                    start = int(start_s)
+                    end = int(end_s)
+                    for p in range(start, end + 1):
+                        # 轉為 0-based index
+                        pages_filter.add(p - 1)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    p = int(part)
+                    pages_filter.add(p - 1)
+                except ValueError:
+                    continue
+
+    if uploaded_pdf is not None:
+        if st.button("開始解析目標 (PDF → JSON)"):
+            st.info(f"正在處理檔案: {uploaded_pdf.name} ... 這可能需要數十秒。")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                tmp_pdf.write(uploaded_pdf.read())
+                tmp_path = Path(tmp_pdf.name)
+
+            try:
+                with st.spinner("Gemini 正在解析圖表與文字..."):
+                    data = _run_extraction(tmp_path, int(report_year), pages_filter)
+                st.session_state.goal_json = data
+                st.success(f"解析完成！共擷取到 {len(data)} 筆目標紀錄。")
+            except Exception as e:  # noqa: BLE001
+                st.session_state.goal_json = None
+                st.error(f"解析過程發生錯誤：{e}")
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    if st.session_state.goal_json:
+        st.subheader("📄 抽取出的目標 JSON")
+        pretty = json.dumps(st.session_state.goal_json, ensure_ascii=False, indent=2)
+        st.code(pretty, language="json")
+
+        file_name = f"ESG_Targets_{int(report_year)}.json"
+        st.download_button(
+            label="📥 下載目標 JSON 檔",
+            data=pretty,
+            file_name=file_name,
+            mime="application/json",
+        )
+
+
+
+
+----------- .\ui\tab_pdf_to_md.py -----------
+
+import os
+import re
+import tempfile
+
+import streamlit as st
+from markitdown import MarkItDown
+
+
+def render() -> None:
+    """Tab 1: 報告轉換 (PDF -> Markdown)"""
+    st.header("步驟一：上傳並轉換報告書")
+    st.markdown("將 PDF 格式的 ESG 報告書轉換為 AI 可讀的 Markdown 格式。")
+
+    uploaded_pdf = st.file_uploader(
+        "上傳 ESG 報告書 (PDF)", type=["pdf"], key="pdf_uploader"
+    )
+
+    # 狀態保存：Markdown 內容
+    if "markdown_content" not in st.session_state:
+        st.session_state.markdown_content = ""
+
+    # 嘗試從檔名自動提取年份
+    default_year = 2024
+    if uploaded_pdf:
+        match = re.search(r"20\d{2}", uploaded_pdf.name)
+        if match:
+            default_year = int(match.group(0))
+
+    report_year = st.number_input(
+        "設定報告年份",
+        min_value=2000,
+        max_value=2030,
+        value=default_year,
+        key="report_year_input",
+    )
+    st.session_state.report_year = report_year
+
+    if uploaded_pdf is not None:
+        if st.button("開始轉換"):
+            st.info(f"正在處理檔案: {uploaded_pdf.name} ...")
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                tmp_pdf.write(uploaded_pdf.read())
+                tmp_pdf_path = tmp_pdf.name
+
+            try:
+                md = MarkItDown()
+                result = md.convert(tmp_pdf_path)
+                st.session_state.markdown_content = result.text_content
+                os.remove(tmp_pdf_path)
+                st.success("轉換成功！請至「產生稽核 Prompt」分頁查看。")
+
+            except Exception as e:  # noqa: BLE001
+                st.error(f"轉換錯誤: {e}")
+                if os.path.exists(tmp_pdf_path):
+                    os.remove(tmp_pdf_path)
+
+    if st.session_state.markdown_content:
+        with st.expander("查看轉換後的 Markdown 內容"):
+            st.text_area(
+                "內容預覽", st.session_state.markdown_content, height=300, key="md_preview"
+            )
+            st.download_button(
+                label="下載 Markdown (.md)",
+                data=st.session_state.markdown_content,
+                file_name=f"report_{report_year}.md",
+                mime="text/markdown",
+            )
+
+
+
+
+----------- .\ui\tab_risk_assessment.py -----------
+
+import json
+from datetime import datetime
+
+import streamlit as st
+
+from core.risk import calculate_risk
+
+
+def render() -> None:
+    """Tab 3: 績效追蹤與風險評估"""
+    st.header("步驟三：績效追蹤與風險評估")
+    st.markdown(
+        """
+    請上傳由 LLM 產出的 **結構化 JSON 檔案**。
+    系統將自動執行：
+    1. **解析歷年數據** (支援絕對值轉百分比，自動將 `(5)%` 轉為 `-5%`)。
+    2. **對應基準年** (Baseline Mapping)。
+    3. **計算風險等級** (線性預期法 + 距離目標法)。
+    """
+    )
+
+    uploaded_json = st.file_uploader(
+        "上傳 LLM 產出的 JSON 檔案", type=["json"], key="json_uploader"
+    )
+
+    if uploaded_json is not None:
+        try:
+            # 讀取 JSON
+            json_data = json.load(uploaded_json)
+            st.success(f"成功讀取檔案！共 {len(json_data)} 筆目標資料。")
+
+            # 執行計算
+            with st.spinner("正在進行風險評估演算法..."):
+                df_result, warnings_list = calculate_risk(json_data)
+
+            # 顯示警告彈窗 (Current_Status 背道而馳)
+            if warnings_list:
+                for warn in warnings_list:
+                    st.error(
+                        f"❌年度: {warn['Year']} - {warn['Focus_Area']} - {warn['Metric']}\n\n"
+                        f"該年度的減量狀況為負數 ({warn['Status']:.1%})，"
+                        f"與目標背道而馳！"
+                    )
+
+            # 顯示結果
+            st.subheader("📊 稽核分析結果")
+
+            # 直接顯示表格（隱藏內部欄位 Has_Negative_Warning）
+            df_display = df_result.drop(columns=["Has_Negative_Warning"], errors="ignore")
+            # 依 Report_Year 預設升序排序（若有此欄位）
+            if "Report_Year" in df_display.columns:
+                try:
+                    df_display = df_display.sort_values(by="Report_Year", ascending=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            st.dataframe(df_display, use_container_width=True)
+
+            # 下載 CSV
+            df_export = df_result.drop(columns=["Has_Negative_Warning"], errors="ignore")
+            csv = df_export.to_csv(index=False, encoding="utf-8-sig")
+            base_name = uploaded_json.name.replace(".json", "")
+            file_name = (
+                f"Audit_Result_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{base_name}.csv"
+            )
+
+            st.download_button(
+                label="📥 下載完整分析報表 (CSV)",
+                data=csv,
+                file_name=file_name,
+                mime="text/csv",
+            )
+
+        except Exception as e:  # noqa: BLE001
+            st.error(f"分析過程發生錯誤: {e}")
+            st.info("請確認上傳的 JSON 格式是否符合 Prompt 定義的 Schema。")
+    else:
+        st.info("👋 等待上傳 JSON 檔案中...")
+
+
+
+

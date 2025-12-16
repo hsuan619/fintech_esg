@@ -3,3 +3,6 @@ pandas
 markitdown[pdf]
 pypdf
 pdfminer.six
+google-generativeai
+python-dotenv
+PyMuPDF
