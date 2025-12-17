@@ -1,5 +1,5 @@
 多目錄文件樹報告
-產生時間: 2025-12-16 13:16:55
+產生時間: 2025-12-16 16:40:55
 (全域忽略規則: .env, .git, .idea, .json, .pdf, .vscode, __pycache__, build, dist, node_modules, process_files.py, test, train, val, venv)
 ==================================================
 
@@ -10,12 +10,15 @@ pepsico
 │   ├── cleaning.py
 │   ├── gemini_client.py
 │   ├── pdf_extractor.py
+│   ├── pdf_extractor_bk.py
 │   ├── prompt.py
 │   ├── risk.py
 │   └── __init__.py
 ├── memory-bank
 │   ├── architecture.md
 │   └── progress.md
+├── tools
+│   └── diagnose_pdf.py
 ├── ui
 │   ├── tab_generate_prompt.py
 │   ├── tab_pdf_to_json.py

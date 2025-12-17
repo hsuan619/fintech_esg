@@ -6,3 +6,5 @@ pdfminer.six
 google-generativeai
 python-dotenv
 PyMuPDF
+pikepdf
+pymupdf

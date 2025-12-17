@@ -1,7 +1,7 @@
 檔案整合報告
 目標目錄: D:\碩一\金融科技\比賽\pepsico
 目標副檔名: .py, .yaml, .md
-產生時間: 2025-12-16 13:16:55
+產生時間: 2025-12-16 16:40:55
 ==================================================
 
 
@@ -771,12 +771,15 @@ markitdown path-to-file.pdf -o document.md
 
 markitdown 2024-ESG-Performance-Metrics.pdf -o 2024-ESG-Performance-Metrics.md
 
+markitdown pdf\中油2024.pdf -o pdf\中油2024.md
 
 ##跑網頁
 streamlit run app.py
 
 
+##診斷
 
+python tools/diagnose_pdf.py D:\碩一\金融科技\比賽\pdf\中油2024.pdf
 ##部署
 https://github.com/hsuan619/fintech_esg.git
 
@@ -1135,16 +1138,12 @@ from typing import Any, Dict, List
 import google.generativeai as genai
 from dotenv import load_dotenv
 
+# 假設 prompt.py 在同一層目錄或正確的 package 下
 from .prompt import get_audit_prompt
-
 
 class GeminiClient:
     """
     輕量封裝 Google Gemini 1.5 Flash
-
-    - 自動從 .env / 環境變數讀取 GOOGLE_API_KEY
-    - 提供圖片前處理 (圖表文字描述)
-    - 以 JSON mode 回傳結構化結果
     """
 
     def __init__(
@@ -1154,18 +1153,13 @@ class GeminiClient:
         api_key: str | None = None,
     ) -> None:
         load_dotenv()
-
         api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            raise RuntimeError(
-                "環境變數 GOOGLE_API_KEY 未設定，請在專案根目錄建立 .env 並加入：\n"
-                "GOOGLE_API_KEY=你的_API_Key"
-            )
-
+            raise RuntimeError("Environment variable GOOGLE_API_KEY not set.")
+        
         genai.configure(api_key=api_key)
-
         self._model = genai.GenerativeModel(model_name)
-        # 視覺前處理可用不同 model；若未指定則共用同一個
+        # Vision 模型可以用更強的 Pro 版本，或共用 Flash
         self._vision_model = (
             genai.GenerativeModel(vision_model_name)
             if vision_model_name
@@ -1174,32 +1168,36 @@ class GeminiClient:
 
     def _describe_images(self, images: List[bytes]) -> str:
         """
-        使用 Vision 模型先把圖表「翻譯成文字」，特別是抽出年度 + 數值的歷史趨勢。
-        回傳：單一長文字描述，可直接拼在 content 後面。
+        使用 Vision 模型將圖表「翻譯」成文字。
+        **關鍵：強制要求忽略 PDF 文字層的亂序，改用視覺對齊。**
         """
         if not images:
             return ""
 
         parts: List[Any] = [
             (
-                "你是一位 ESG 報告稽核員，請專注解析**圖表或趨勢圖**中的：\n"
-                "1. 目標值 (Target) 與目標年度 (例如 2025年 2,467 萬噸, 2030年 2,271 萬噸)\n"
-                "2. 歷史進度 (Results / Status)：請盡可能列出所有「年度 + 數值」的資料點\n"
-                "   - 請用類似 `2005: 2,567 萬噸`, `2006: 2,710 萬噸` 的格式逐年列出\n"
-                "3. 基準年 (Baseline) 以及與基準年的減量百分比 (若有標示，例如「比 2007 年減少 22%」)\n\n"
-                "請用條列式輸出，每個圖表一段，務必把你能看見的所有年度與數值都寫出來。"
+                "你是一位 ESG 報告稽核員，請專注解析圖片中的**圖表、趨勢圖或路徑圖**。\n"
+                "**嚴重警告：此 PDF 的原始文字層順序是錯亂的（依高度而非時間排序）。**\n"
+                "**請務必忽略任何隱藏的文字層順序，嚴格執行「視覺掃描」：**\n\n"
+                "1. **視覺定位 X 軸 (年份)**：先找到圖表下方的年份標示 (如 2005, 2010...)。\n"
+                "2. **從左到右讀取數據**：根據折線或長條的物理位置，由左至右對應到正確的年份。\n"
+                "3. **請提取以下資訊**：\n"
+                "   - 目標值 (Target)：年份與數值 (例如 2025年 2,467 萬噸)。\n"
+                "   - 歷史進度 (Historical Data)：請列出所有可見的「年份: 數值」數據點。\n"
+                "     (格式範例：`2005: 2,567`, `2006: 2,710`)\n"
+                "   - 基準年 (Baseline)：若有標示，請指出基準年數值。\n\n"
+                "請輸出一段詳細的文字描述，供後續數據校對使用。"
             )
         ]
 
         for img in images:
-            parts.append(
-                {
-                    "mime_type": "image/png",
-                    "data": img,
-                }
-            )
+            parts.append({"mime_type": "image/png", "data": img})
 
-        response = self._vision_model.generate_content(parts)
+        # 使用 temperature=0.0 以獲得最客觀的數據讀取
+        response = self._vision_model.generate_content(
+            parts, 
+            generation_config=genai.types.GenerationConfig(temperature=0.0)
+        )
         return response.text or ""
 
     def extract_goals_from_page(
@@ -1208,66 +1206,363 @@ class GeminiClient:
         page_text: str,
         images: List[bytes],
         current_year: int,
+        mode: str = "TEXT"  # [新增] 接收來自 extractor 的模式
     ) -> List[Dict[str, Any]]:
         """
-        核心方法：給一頁 PDF 的文字 + 圖片，回傳該頁所有「承諾目標」的 JSON list。
+        核心方法：
+        1. 若是 HYBRID，先看圖產生描述。
+        2. 將 文字 + 描述 + 警告 組合後，填入 prompt.py 的樣板。
+        3. 讓 LLM 輸出 JSON。
         """
-        image_desc = self._describe_images(images)
+        image_desc = ""
+        
+        # 步驟 1: 只有在 HYBRID 模式且有圖片時，才呼叫 Vision Model
+        if mode == "HYBRID" and images:
+            image_desc = self._describe_images(images)
 
-        # 將原始文字與圖片描述合併，丟給 Prompt 模板
-        merged_content_parts: List[str] = ["# Page Text", page_text.strip()]
-        if image_desc:
-            merged_content_parts.extend(
-                [
-                    "",
-                    "# Image-derived Details",
-                    image_desc.strip(),
-                ]
+        # 步驟 2: 組合最終要送給 LLM 的 context
+        merged_content_parts: List[str] = []
+
+        # [系統警告]：若是 HYBRID，告訴主模型不要太相信原始文字的順序
+        if mode == "HYBRID" and images:
+            merged_content_parts.append(
+                "⚠️ [SYSTEM WARNING]: This page contains Charts/Graphs with potentially jumbled text layers. "
+                "Please PRIORITIZE the information in the '# Image-derived Details' section below "
+                "for any trend data, year-value alignment, or chart interpretation."
             )
 
-        merged_content = "\n".join(merged_content_parts)
-        prompt = get_audit_prompt(current_year=current_year, content=merged_content)
+        merged_content_parts.append(f"# Raw Page Text\n{page_text.strip()}")
+        
+        if image_desc:
+            merged_content_parts.append(
+                f"\n# Image-derived Details (High Confidence for Charts)\n{image_desc.strip()}"
+            )
 
+        final_content = "\n".join(merged_content_parts)
+
+        # 步驟 3: 呼叫 prompt.py 中的函數來產生最終 Prompt
+        # 這裡的 final_content 已經包含了 警告 + 文字 + 圖片描述
+        prompt = get_audit_prompt(current_year=current_year, content=final_content)
+
+        # 步驟 4: 送出請求
         response = self._model.generate_content(
             [prompt],
             generation_config=genai.types.GenerationConfig(
-                response_mime_type="application/json"
+                response_mime_type="application/json",
+                temperature=0.1
             ),
         )
 
         raw_text = response.text or "[]"
 
+        # 步驟 5: JSON 解析 (維持不變)
         try:
             data = json.loads(raw_text)
         except json.JSONDecodeError:
-            # 若模型外層多包一層物件，嘗試幾個常見 key
             try:
                 obj = json.loads(raw_text)
                 for key in ("items", "data", "results"):
                     if key in obj and isinstance(obj[key], list):
                         return obj[key]
-                # 如果是單一物件而非 list，就包成 list
-                if isinstance(obj, dict):
-                    return [obj]
-                if isinstance(obj, list):
-                    return obj
+                if isinstance(obj, dict): return [obj]
+                if isinstance(obj, list): return obj
             except Exception:
-                # 最後退路：直接回傳空 list，避免整體流程中斷
                 return []
 
-        if isinstance(data, dict):
-            return [data]
-        if isinstance(data, list):
-            return data
+        if isinstance(data, dict): return [data]
+        if isinstance(data, list): return data
         return []
-
 
 __all__ = ["GeminiClient"]
 
-
-
-
 ----------- .\core\pdf_extractor.py -----------
+
+# import fitz  # PyMuPDF
+# import numpy as np
+# from typing import Any, Dict, List
+
+# def analyze_page_metrics(page: fitz.Page) -> Dict[str, Any]:
+#     """
+#     核心分析邏輯：分析頁面的文字分佈、繪圖物件與文字量
+#     原則：結合「物理特徵 (Density/Drawings)」與「語義特徵 (Keywords)」來區分複雜表格與圖表。
+#     """
+#     # 1. 提取基礎資訊
+#     raw_text = page.get_text()
+#     text_len = len(raw_text.strip())
+#     words = page.get_text("words")
+#     drawings = page.get_drawings()
+#     drawing_count = len(drawings)
+#     images = page.get_images(full=True)
+#     img_count = len(images)
+
+#     # 2. 語義關鍵字偵測 (Semantic Keyword Detection)
+#     # 當物理指標(線條/密度)無法區分表格與圖表時，這些詞是關鍵線索
+#     chart_keywords = [
+#         "趨勢圖", "分析圖", "統計圖", "走勢圖", "分布圖", "示意圖", "路徑圖",
+#         "Figure", "Chart", "Graph", "Diagram", "Trend", "Plot"
+#     ]
+#     # 檢查前 500 個字元通常能包含標題，不需要掃描全文
+#     header_text = raw_text[:800] 
+#     has_chart_keyword = any(k in header_text for k in chart_keywords)
+
+#     # 3. 計算垂直密度直方圖
+#     page_height = page.rect.height
+#     densities = [0.0, 0.0, 0.0]
+    
+#     if page_height > 0 and len(words) > 0:
+#         y_positions = [w[1] for w in words]
+#         hist, _ = np.histogram(y_positions, bins=10, range=(0, page_height))
+#         total_words = len(words)
+#         bin_densities = hist / total_words
+        
+#         top_density = sum(bin_densities[:3])
+#         middle_density = sum(bin_densities[3:7])
+#         bottom_density = sum(bin_densities[7:])
+#         densities = [top_density, middle_density, bottom_density]
+
+#     # 4. 決策樹邏輯 (Decision Tree)
+#     mode = "TEXT"
+#     reason = "Normal Text"
+
+#     # === 規則 0: 高文字量防護網 (Priority 1) ===
+#     # 文字極多時，代表主要資訊是文字，忽略圖表特徵
+#     if text_len > 1500:
+#         mode = "TEXT"
+#         reason = "High Text Density (Report/Table)"
+
+#     # === 規則 A: 掃描檔/空頁 ===
+#     elif text_len < 100:
+#         if img_count > 0:
+#             mode = "VISION"
+#             reason = "Scanned Page (Image Dominant)"
+#         else:
+#             mode = "VISION"
+#             reason = "Sparse Content"
+
+#     # === 規則 B: 圖片存在 ===
+#     elif img_count > 0:
+#         mode = "HYBRID"
+#         reason = "Image Detected (with Low Text)"
+
+#     # === 規則 C: 向量圖形判定 (The Tie-Breaker) ===
+#     # 當線條數量夠多 (>50) 時，我們需要區分是「複雜表格」還是「圖表」
+#     elif drawing_count > 50:
+#         # 情況 1: 中間很空 -> 肯定是圖表 (Chart)
+#         if middle_density < 0.2:
+#             mode = "HYBRID"
+#             reason = "Vector Chart (Hollow Middle)"
+        
+#         # 情況 2: 中間有字 (可能是表格，也可能是圖表+標籤) -> 啟用關鍵字檢查
+#         elif has_chart_keyword:
+#             mode = "HYBRID"
+#             reason = "Chart Keyword Detected ('趨勢圖'/Figure)"
+        
+#         # 情況 3: 中間有字且沒關鍵字 -> 視為表格 (Table)
+#         else:
+#             mode = "TEXT"
+#             reason = "Complex Table (Vectors + Dense Text)"
+
+#     # === 規則 D: 佈局偵測 (Layout Detection) ===
+#     elif (top_density > 0.4 or (top_density + bottom_density > 0.6)):
+#         # 同樣加入關鍵字輔助
+#         if middle_density < 0.15:
+#             if drawing_count > 5 or has_chart_keyword:
+#                 mode = "HYBRID"
+#                 reason = "Chart Layout (Hollow Middle)"
+#             else:
+#                 mode = "TEXT" # 純排版留白
+#                 reason = "Layout Gap"
+#         else:
+#             mode = "TEXT"
+#             reason = "Table Layout (Text in Middle)"
+
+#     # === 預設 ===
+#     else:
+#         mode = "TEXT"
+#         reason = "Uniform Text Distribution"
+
+#     return {
+#         "mode": mode,
+#         "reason": reason,
+#         "text_len": text_len,
+#         "img_count": img_count,
+#         "drawing_count": drawing_count,
+#         "densities": densities
+#     }
+
+# # extract_mixed_content 維持不變...
+# def extract_mixed_content(pdf_path: str) -> List[Dict[str, Any]]:
+#     pages_data: List[Dict[str, Any]] = []
+#     doc = fitz.open(pdf_path)
+    
+#     for i in range(len(doc)):
+#         page = doc.load_page(i)
+#         metrics = analyze_page_metrics(page)
+#         mode = metrics["mode"]
+        
+#         final_text = ""
+#         final_images = []
+
+#         if mode == "VISION":
+#             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+#             final_images.append(pix.tobytes("png"))
+#             final_text = "[System: Scanned Page / Image Detected]"
+#         elif mode == "HYBRID":
+#             final_text = page.get_text()
+#             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+#             final_images.append(pix.tobytes("png"))
+#         else:
+#             final_text = page.get_text()
+
+#         pages_data.append({
+#             "page_index": i,
+#             "text": final_text,
+#             "images": final_images,
+#             "mode": mode,
+#             "debug_reason": metrics["reason"]
+#         })
+
+#     doc.close()
+#     return pages_data
+
+
+import fitz  # PyMuPDF
+import numpy as np
+from typing import Any, Dict, List
+
+def analyze_page_metrics(page: fitz.Page) -> Dict[str, Any]:
+    """
+    核心分析邏輯：結合「物理特徵」與「語義特徵」來區分複雜表格與圖表。
+    """
+    # 1. 提取基礎資訊
+    raw_text = page.get_text()
+    text_len = len(raw_text.strip())
+    words = page.get_text("words")
+    drawings = page.get_drawings()
+    drawing_count = len(drawings)
+    images = page.get_images(full=True)
+    img_count = len(images)
+
+    # 2. [關鍵修改] 語義關鍵字偵測
+    # 當物理指標無法區分表格與圖表時，這些詞是關鍵線索
+    chart_keywords = [
+        "趨勢圖", "分析圖", "統計圖", "走勢圖", "分布圖", "示意圖", "路徑圖",
+        "Figure", "Chart", "Graph", "Diagram", "Trend", "Plot", "Performance"
+    ]
+    # 檢查前 1000 個字元 (通常包含標題)
+    header_text = raw_text[:1000] 
+    has_chart_keyword = any(k in header_text for k in chart_keywords)
+
+    # 3. 計算垂直密度直方圖
+    page_height = page.rect.height
+    densities = [0.0, 0.0, 0.0]
+    
+    if page_height > 0 and len(words) > 0:
+        y_positions = [w[1] for w in words]
+        hist, _ = np.histogram(y_positions, bins=10, range=(0, page_height))
+        total_words = len(words)
+        bin_densities = hist / total_words
+        
+        top_density = sum(bin_densities[:3])
+        middle_density = sum(bin_densities[3:7])
+        bottom_density = sum(bin_densities[7:])
+        densities = [top_density, middle_density, bottom_density]
+
+    # 4. 決策樹邏輯
+    mode = "TEXT"
+    reason = "Normal Text"
+
+    # Rule 0: 高文字量防護 (Priority 1)
+    if text_len > 1500:
+        mode = "TEXT"
+        reason = "High Text Density (Report/Table)"
+
+    # Rule A: 掃描檔/空頁
+    elif text_len < 100:
+        if img_count > 0:
+            mode = "VISION"
+            reason = "Scanned Page (Image Dominant)"
+        else:
+            mode = "VISION"
+            reason = "Sparse Content"
+
+    # Rule B: 圖片存在
+    elif img_count > 0:
+        mode = "HYBRID"
+        reason = "Image Detected (with Low Text)"
+
+    # Rule C: 向量圖形判定 (關鍵修改)
+    elif drawing_count > 50:
+        # 情況 1: 中間很空 -> 肯定是圖表
+        if middle_density < 0.2:
+            mode = "HYBRID"
+            reason = "Vector Chart (Hollow Middle)"
+        # 情況 2: 中間有字 + 有關鍵字 -> 強制 HYBRID (解決台塑案例)
+        elif has_chart_keyword:
+            mode = "HYBRID"
+            reason = "Chart Keyword Detected"
+        # 情況 3: 中間有字 + 無關鍵字 -> 視為複雜表格
+        else:
+            mode = "TEXT"
+            reason = "Complex Table (Vectors + Dense Text)"
+
+    # Rule D: 佈局偵測
+    elif (top_density > 0.4 or (top_density + bottom_density > 0.6)):
+        if middle_density < 0.15:
+            if drawing_count > 5 or has_chart_keyword:
+                mode = "HYBRID"
+                reason = "Chart Layout (Hollow Middle)"
+            else:
+                mode = "TEXT"
+                reason = "Layout Gap"
+        else:
+            mode = "TEXT"
+            reason = "Table Layout (Text in Middle)"
+
+    else:
+        mode = "TEXT"
+        reason = "Uniform Text Distribution"
+
+    return {
+        "mode": mode,
+        "reason": reason,
+        "text_len": text_len
+    }
+
+def extract_mixed_content(pdf_path: str) -> List[Dict[str, Any]]:
+    pages_data: List[Dict[str, Any]] = []
+    doc = fitz.open(pdf_path)
+    
+    for i in range(len(doc)):
+        page = doc.load_page(i)
+        metrics = analyze_page_metrics(page)
+        mode = metrics["mode"]
+        
+        final_text = ""
+        final_images = []
+
+        if mode == "VISION":
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            final_images.append(pix.tobytes("png"))
+            final_text = "[System: Scanned Page / Image Detected]"
+        elif mode == "HYBRID":
+            final_text = page.get_text()
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            final_images.append(pix.tobytes("png"))
+        else:
+            final_text = page.get_text()
+
+        pages_data.append({
+            "page_index": i,
+            "text": final_text,
+            "images": final_images,
+            "mode": mode
+        })
+
+    doc.close()
+    return pages_data
+
+----------- .\core\pdf_extractor_bk.py -----------
 
 from typing import Any, Dict, List
 
@@ -2090,6 +2385,84 @@ def calculate_risk(
 
 
 
+----------- .\tools\diagnose_pdf.py -----------
+
+import fitz
+import sys
+import os
+from prettytable import PrettyTable
+
+# 確保可以 import 到 core 模組
+# 假設 tools 資料夾與 core 資料夾在同一層級
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+try:
+    from core.pdf_extractor import analyze_page_metrics
+except ImportError:
+    print("錯誤: 無法匯入 core.pdf_extractor。請確認目錄結構是否正確。")
+    sys.exit(1)
+
+def diagnose_pdf(pdf_path):
+    if not os.path.exists(pdf_path):
+        print(f"錯誤：找不到檔案 {pdf_path}")
+        return
+
+    doc = fitz.open(pdf_path)
+    print(f"\n正在診斷檔案: {os.path.basename(pdf_path)}")
+    print(f"總頁數: {len(doc)}\n")
+
+    # 設定表格欄位
+    table = PrettyTable()
+    table.field_names = [
+        "Page", "Mode", "Tokens", "Drawings", 
+        "Top %", "Mid %", "Bot %", "Reason"
+    ]
+    table.align = "l"
+    table.float_format = "0.2" # 小數點兩位
+
+    for i in range(len(doc)):
+        page = doc.load_page(i)
+        
+        # 使用與 pdf_extractor 完全相同的邏輯
+        metrics = analyze_page_metrics(page)
+        
+        mode = metrics["mode"]
+        densities = metrics["densities"]
+        
+        # 顏色標記 (ANSI codes)
+        mode_display = mode
+        if mode == "HYBRID":
+            mode_display = f"\033[93m{mode}\033[0m" # 黃色
+        elif mode == "VISION":
+            mode_display = f"\033[91m{mode}\033[0m" # 紅色
+        else:
+            mode_display = f"\033[92m{mode}\033[0m" # 綠色
+
+        table.add_row([
+            i + 1,
+            mode_display,
+            metrics["text_len"],
+            metrics["drawing_count"],
+            f"{densities[0]*100:.1f}%", # Top Density
+            f"{densities[1]*100:.1f}%", # Mid Density
+            f"{densities[2]*100:.1f}%", # Bot Density
+            metrics["reason"]
+        ])
+
+    print(table)
+    print("\n[欄位說明]")
+    print("Drawings: 向量繪圖指令數量 (線條、路徑)。數量 > 50 通常代表有複雜圖表。")
+    print("Top/Mid/Bot %: 文字在頁面上、中、下區域的分佈比例。")
+    print("  - Top-Heavy (Top% 高, Mid% 低) 通常代表上方表格 + 下方圖表。")
+    
+    doc.close()
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("用法: python tools/diagnose_pdf.py <pdf_path>")
+    else:
+        diagnose_pdf(sys.argv[1])
+
 ----------- .\ui\__init__.py -----------
 
 """
@@ -2284,7 +2657,7 @@ def render() -> None:
         pretty = json.dumps(st.session_state.goal_json, ensure_ascii=False, indent=2)
         st.code(pretty, language="json")
 
-        file_name = f"ESG_Targets_{int(report_year)}.json"
+        file_name = f"{uploaded_pdf.name}_{int(report_year)}.json"
         st.download_button(
             label="📥 下載目標 JSON 檔",
             data=pretty,

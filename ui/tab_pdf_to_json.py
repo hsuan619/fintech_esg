@@ -143,7 +143,7 @@ def render() -> None:
         pretty = json.dumps(st.session_state.goal_json, ensure_ascii=False, indent=2)
         st.code(pretty, language="json")
 
-        file_name = f"ESG_Targets_{int(report_year)}.json"
+        file_name = f"{uploaded_pdf.name}_{int(report_year)}.json"
         st.download_button(
             label="📥 下載目標 JSON 檔",
             data=pretty,
