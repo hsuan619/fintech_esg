@@ -17,7 +17,7 @@ except ImportError:
 
 def render() -> None:
     """Tab 4: 手動處理模式 (預覽圖片 + 產生 Prompt)"""
-    st.header("步驟四：手動處理模式 (免 API)")
+    st.header("PDF手動處理模式 (免 API)")
     st.markdown(
         """
         當 API 額度不足或需要除錯時，可使用此模式：

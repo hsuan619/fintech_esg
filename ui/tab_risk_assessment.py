@@ -8,7 +8,7 @@ from core.risk import calculate_risk
 
 def render() -> None:
     """Tab 3: 績效追蹤與風險評估"""
-    st.header("步驟三：績效追蹤與風險評估")
+    st.header("績效追蹤與風險評估")
     st.markdown(
         """
     請上傳由 LLM 產出的 **結構化 JSON 檔案**。

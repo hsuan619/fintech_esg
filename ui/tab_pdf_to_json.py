@@ -56,7 +56,7 @@ def _run_extraction(
 
 def render() -> None:
     """單一頁籤：上傳 PDF → 直接產出目標 JSON。"""
-    st.header("步驟一：上傳 ESG 報告並自動擷取目標 (PDF → JSON)")
+    st.header("需要API：上傳 ESG 報告並自動擷取目標 (PDF → JSON)")
     st.markdown(
         """
         上傳 ESG 報告 PDF 後，系統將：
