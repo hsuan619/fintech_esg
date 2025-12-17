@@ -8,15 +8,8 @@ import streamlit as st
 from core.pdf_extractor import extract_mixed_content
 from core.prompt import get_audit_prompt
 
-# [新增] 匯入解鎖工具
-try:
-    from protected import PDFTextLiberator
-except ImportError:
-    # 避免因為路徑問題導致整個 App 壞掉，做個簡單的 mock 或 pass
-    PDFTextLiberator = None
-
 def render() -> None:
-    """Tab 4: 手動處理模式 (預覽圖片 + 產生 Prompt)"""
+    """Tab 4: 手動模式 (預覽圖片 + 產生 Prompt)"""
     st.header("步驟四：手動處理模式 (免 API)")
     st.markdown(
         """
@@ -29,14 +22,6 @@ def render() -> None:
 
     uploaded_pdf = st.file_uploader(
         "上傳 ESG 報告書 (PDF)", type=["pdf"], key="pdf_uploader_manual"
-    )
-
-    # [新增] 解鎖功能勾選框
-    use_unlocker = st.checkbox(
-        "🔓 嘗試解除 PDF 權限鎖定 (適用於無法複製文字的加密檔案)", 
-        value=False, 
-        key="enable_unlock_manual",
-        help="若發現解析出的文字是亂碼或空白，請勾選此選項。系統將嘗試移除 Owner Password 限制。"
     )
 
     report_year = st.number_input(
@@ -63,23 +48,7 @@ def render() -> None:
                     tmp_path = Path(tmp_pdf.name)
 
                 try:
-                    # [新增] 執行解鎖邏輯
-                    if use_unlocker:
-                        if PDFTextLiberator is None:
-                            st.warning("⚠️ 找不到 protected.py 模組，無法執行解鎖。")
-                        else:
-                            with st.spinner("正在執行 PDF 解鎖程序 (pikepdf)..."):
-                                liberator = PDFTextLiberator(str(tmp_path))
-                                if liberator.unlock_pdf():
-                                    st.success("✅ PDF 權限解鎖成功！正在覆寫暫存檔...")
-                                    # 將解鎖後的記憶體串流寫回硬碟，讓後面的 extract_mixed_content 讀取
-                                    with open(tmp_path, "wb") as f:
-                                        f.write(liberator.unlocked_stream.getbuffer())
-                                else:
-                                    st.warning("⚠️ 解鎖失敗或無需解鎖，將使用原始檔案繼續處理。")
-
                     # 2. 執行核心提取 (不呼叫 Gemini Client)
-                    # 注意：如果上面解鎖成功，這裡讀取的 tmp_path 已經是解鎖後的檔案
                     pages = extract_mixed_content(str(tmp_path))
                     
                     # 3. 處理頁碼過濾
